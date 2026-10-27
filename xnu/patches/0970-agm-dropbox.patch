@@ -1,0 +1,294 @@
+agm-0970: AGM H6 drop box (bsd/dev/agm_dropbox.c): files for the iOS root written from Android
+into iosroot at 32 GiB (agm-h6/tools/agm-drop.py: header AGMDROP1, generation, up to 31 entries
+with an FNV-1a 64 hash each) are written into place by a kernel thread once the root is
+writable, once per generation (/usr/lib/agm-drop.gen); boot-arg agm_drop=0: left alone.
+And the display waits for the Mali to be done with a surface and drops what the processors'
+caches hold of it before showing it (RedwoodGPU.cpp topaz_surface_drawn() on AGM).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 48543a685..c3065ccb6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/topaz_sta.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/agm_keys.c			standard
++bsd/dev/agm_dropbox.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/agm_dropbox.c b/bsd/dev/agm_dropbox.c
+new file mode 100644
+index 000000000..e067026bc
+--- /dev/null
++++ b/bsd/dev/agm_dropbox.c
+@@ -0,0 +1,213 @@
++/*
++ * AGM H6: files for the iOS root, dropped from Android (agm-h6/tools/agm-drop.py).
++ *
++ * The iOS volume takes the first 16 GiB of the 128 GiB partition iosroot; the console log the
++ * last 4100 KiB. At AGM_DROP_OFF (32 GiB) there may be a drop: a 4096-byte header ("AGMDROP1",
++ * a generation, up to 31 entries: path, mode, where in the drop and how long, an FNV-1a 64 hash
++ * of the bytes) followed by the files' bytes. Once the root is mounted read-write, a kernel
++ * thread writes every entry whose bytes hash right into its path (the directory must exist),
++ * root:wheel with the mode given, and notes the generation in AGM_DROP_DONE, so a drop is
++ * written once. Nothing else of the partition is read, and nothing of it is written.
++ * Boot-arg agm_drop=0: drops are left alone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/mount.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/kernel.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++extern vnode_t rootvnode;
++void agm_dropbox_start(void);
++
++#define AGM_DROP_PART           "iosroot"
++#define AGM_DROP_OFF            (32ull << 30)
++#define AGM_DROP_MAX            (1ull << 30)
++#define AGM_DROP_ENTRIES        31
++#define AGM_DROP_CHUNK          (1u << 20)
++#define AGM_DROP_DONE           "/usr/lib/agm-drop.gen"
++
++struct agm_drop_entry {
++	char path[96];
++	uint32_t mode, flags;
++	uint64_t offset, size;                  /* offset from the drop's start */
++	uint64_t hash;                          /* FNV-1a 64 of the bytes */
++};
++struct agm_drop_header {
++	char magic[8];
++	uint32_t count, version;
++	uint64_t generation;
++	uint8_t pad[40];
++	struct agm_drop_entry entry[AGM_DROP_ENTRIES];
++};
++_Static_assert(sizeof(struct agm_drop_entry) == 128, "entry");
++_Static_assert(sizeof(struct agm_drop_header) == 4032, "header");
++
++static uint64_t
++fnv(uint64_t h, const uint8_t *p, size_t n)
++{
++	while (n--) {
++		h = (h ^ *p++) * 0x100000001b3ull;
++	}
++	return h;
++}
++
++static uint64_t
++done_generation(vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	char buf[24] = { 0 };
++	int resid = 0;
++	uint64_t g = 0;
++
++	if (vnode_open(AGM_DROP_DONE, FREAD, 0, 0, &vp, ctx) != 0) {
++		return 0;
++	}
++	if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, sizeof(buf) - 1, 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx),
++	    &resid, vfs_context_proc(ctx)) == 0) {
++		for (char *c = buf; *c >= '0' && *c <= '9'; c++) {
++			g = g * 10 + (uint64_t)(*c - '0');
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	return g;
++}
++
++/* The bytes of a file are read from the drop a chunk at a time (into buf); NULL src: hashed only. */
++static int
++drop_pass(uint64_t at, uint64_t size, uint8_t *buf, uint64_t *hash, vnode_t vp, vfs_context_t ctx)
++{
++	int error = 0, resid = 0;
++
++	*hash = 0xcbf29ce484222325ull;
++	for (uint64_t done = 0; !error && done < size;) {
++		uint32_t n = (uint32_t)MIN(size - done, (uint64_t)AGM_DROP_CHUNK);
++		error = sweet_ufs_read_part(AGM_DROP_PART, at + done, buf, n);
++		if (!error) {
++			*hash = fnv(*hash, buf, n);
++		}
++		if (!error && vp != NULLVP) {
++			error = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, (int)n, (off_t)done, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		}
++		done += n;
++	}
++	return error;
++}
++
++static int
++open_for_writing(const char *path, uint32_t mode, vnode_t *vp, vfs_context_t ctx)
++{
++	return vnode_open(path, FWRITE | O_CREAT | O_TRUNC, (int)(mode & 07777), 0, vp, ctx);
++}
++
++static void
++finish_file(vnode_t vp, uint32_t mode, vfs_context_t ctx)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	VATTR_SET(&va, va_uid, 0);
++	VATTR_SET(&va, va_gid, 0);
++	(void)vnode_setattr(vp, &va, ctx);
++	vnode_close(vp, FWRITE, ctx);
++}
++
++static void
++agm_dropbox_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct agm_drop_header *h;
++	uint8_t *data = NULL;
++	int waited = 0;
++
++	/* the root, mounted read-write (launchd may remount it so) */
++	while (rootvnode == NULLVP || vfs_isrdonly(vnode_mount(rootvnode))) {
++		if (waited++ > 600) {
++			printf("AGM DROP: the root never became writable\n");
++			return;
++		}
++		(void)tsleep(&waited, PZERO, "agmdrop", hz / 10);
++	}
++	h = kalloc_data(sizeof(*h), Z_WAITOK | Z_ZERO);
++	if (h == NULL || sweet_ufs_read_part(AGM_DROP_PART, AGM_DROP_OFF, h, sizeof(*h)) != 0) {
++		printf("AGM DROP: cannot read the drop header\n");
++		goto out;
++	}
++	if (memcmp(h->magic, "AGMDROP1", 8) != 0 || h->count == 0 || h->count > AGM_DROP_ENTRIES) {
++		goto out;                       /* no drop */
++	}
++	uint64_t done = done_generation(ctx);
++	if (done == h->generation) {
++		printf("AGM DROP: generation %llu written before\n", h->generation);
++		goto out;
++	}
++	unsigned written = 0;
++	data = kalloc_data(AGM_DROP_CHUNK, Z_WAITOK);
++	if (data == NULL) {
++		goto out;
++	}
++	for (uint32_t i = 0; i < h->count; i++) {
++		struct agm_drop_entry *e = &h->entry[i];
++		e->path[sizeof(e->path) - 1] = 0;
++		if (e->path[0] != '/' || e->offset < sizeof(*h) || e->size > AGM_DROP_MAX || e->offset > AGM_DROP_MAX - e->size) {
++			printf("AGM DROP: entry %u (%s) refused\n", i, e->path);
++			continue;
++		}
++		uint64_t hash = 0;
++		vnode_t vp = NULLVP;
++		/* first the bytes are checked, then written: a bad drop leaves the old file */
++		int error = drop_pass(AGM_DROP_OFF + e->offset, e->size, data, &hash, NULLVP, ctx);
++		if (!error && hash != e->hash) {
++			error = EIO;
++		}
++		if (!error && (error = open_for_writing(e->path, e->mode, &vp, ctx)) == 0) {
++			error = drop_pass(AGM_DROP_OFF + e->offset, e->size, data, &hash, vp, ctx);
++			finish_file(vp, e->mode, ctx);
++		}
++		printf("AGM DROP: %s, %llu bytes, mode %o: %s (%d)\n", e->path, e->size, e->mode,
++		    error ? "NOT written" : "written", error);
++		written += error == 0;
++	}
++	if (written == h->count) {
++		char g[24];
++		vnode_t vp = NULLVP;
++		int resid = 0;
++		snprintf(g, sizeof(g), "%llu\n", h->generation);
++		if (open_for_writing(AGM_DROP_DONE, 0644, &vp, ctx) == 0) {
++			(void)vn_rdwr(UIO_WRITE, vp, (caddr_t)g, (int)strlen(g), 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			finish_file(vp, 0644, ctx);
++		}
++	}
++	printf("AGM DROP: generation %llu: %u of %u files written\n", h->generation, written, h->count);
++out:
++	if (data != NULL) {
++		kfree_data(data, AGM_DROP_CHUNK);
++	}
++	if (h != NULL) {
++		kfree_data(h, sizeof(*h));
++	}
++}
++
++void
++agm_dropbox_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("agm_drop", &on, sizeof(on));
++	if (on && kernel_thread_start(agm_dropbox_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_AGM */
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index 3ce4a3a61..6294afefd 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -743,6 +743,8 @@ agm_keys_init(void)
+ 		extern void agm_mali_selftest(void);
+ 		agm_mali_selftest();
+ 	}
++	extern void agm_dropbox_start(void);
++	agm_dropbox_start();
+ 	dmsk = 0;
+ 	if (PE_parse_boot_argn("agm_gpu", &dmsk, sizeof(dmsk)) && dmsk != 0) {
+ 		extern void AgmMaliGPUStart(void);
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e556908..3e55b906f 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -223,6 +223,30 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
+ }
+ 
+ /* the display waits for the GPU to be done drawing a surface before it shows it */
++#if defined(SWEET_AGM)
++extern "C" bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++/* AGM H6: the Mali (AgmMaliGPU.cpp) is not coherent with the processors: once it is done, what
++ * their caches may hold of the surface goes, so the display reads what the GPU wrote. */
++bool
++topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
++{
++	uint32_t fence = surface->drawn;
++
++	if (fence == 0) {
++		return true;
++	}
++	if (!agm_mali_wait(fence, milliseconds)) {
++		return false;
++	}
++	if (surface->kernelAddress() != 0) {
++		sweet_dcache_flush((vm_offset_t)surface->kernelAddress(), surface->allocSize);
++	}
++	(void)__sync_bool_compare_and_swap(&surface->drawn, fence, 0);
++	return true;
++}
++#else
+ bool
+ topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
+ {
+@@ -236,6 +260,7 @@ topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
+ 	}
+ 	return done;
+ }
++#endif
+ 
+ /*
+  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or

@@ -1,0 +1,555 @@
+agm-0981: AGM H6 Wi-Fi step 1 (bsd/dev/agm_wcn.c): boot-arg agm_wcn=1 powers the integrated
+Marlin3 WCN (SC2730 LDOs, Merlion GPIOs, PMU), loads /usr/lib/agm-wcnmodem.bin (Android's
+/odm/firmware/wcnmodem.bin, dropped into the root) to DDR 0x87000000, starts the CP and waits for
+its ready word. agm_keys.c exports agm_pmic_rd/wr and agm_gpio_out.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c3065ccb6..b2f4ceed4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/agm_keys.c			standard
+ bsd/dev/agm_dropbox.c			standard
++bsd/dev/agm_wcn.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index 8abf20185..a13985a60 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -46,6 +46,9 @@
+  * defaults (VOREG differs) the setup is applied again. REG0 STAT bits 5:4
+  * (0 ready, 1 charging, 2 done, 3 fault) feed SweetBattery.
+  *
++ * Wi-Fi: boot-arg agm_wcn=1 starts the Marlin3 WCN (bsd/dev/agm_wcn.c) through agm_pmic_rd/wr and
++ * agm_gpio_out.
++ *
+  * GPU: boot-arg agm_gpu_test=1 runs the Mali self test (iokit/Kernel/arm/AgmMali.cpp),
+  * agm_gpu=1 starts the AgmMaliGPU service for Mesa's panfrost (AgmMaliGPU.cpp).
+  *
+@@ -594,6 +597,38 @@ agm_gpio_get(unsigned n)
+ 	return (rd32(agm_gpio + (n >> 4) * 0x80 + GPIO_DATA) >> (n & 15)) & 1;
+ }
+ 
++/* For agm_wcn.c (Wi-Fi): the PMIC and the AP GPIOs, shared with this file. */
++bool agm_pmic_rd(uint32_t reg, uint32_t *val);
++bool agm_pmic_wr(uint32_t reg, uint32_t val);
++void agm_gpio_out(unsigned n, int value);
++
++bool
++agm_pmic_rd(uint32_t reg, uint32_t *val)
++{
++	return agm_pmic_map() && pmic_read(reg, val);
++}
++
++bool
++agm_pmic_wr(uint32_t reg, uint32_t val)
++{
++	return agm_pmic_map() && pmic_write(reg, val);
++}
++
++void
++agm_gpio_out(unsigned n, int value)
++{
++	vm_offset_t b = agm_gpio + (n >> 4) * 0x80;
++	uint32_t bit = 1u << (n & 15);
++
++	if (agm_gpio == 0) {
++		return;
++	}
++	wr32(b + GPIO_DMSK, rd32(b + GPIO_DMSK) | bit);
++	wr32(b + GPIO_DIR, rd32(b + GPIO_DIR) | bit);
++	wr32(b + GPIO_INEN, rd32(b + GPIO_INEN) & ~bit);
++	wr32(b + GPIO_DATA, value ? (rd32(b + GPIO_DATA) | bit) : (rd32(b + GPIO_DATA) & ~bit));
++}
++
+ static uint16_t
+ ts_crc16(const uint8_t *p, unsigned n)
+ {
+@@ -827,6 +862,8 @@ agm_keys_init(void)
+ 			thread_deallocate(probe);
+ 		}
+ 	}
++	extern void agm_wcn_start(void);
++	agm_wcn_start();
+ 	dmsk = 0;
+ 	if (PE_parse_boot_argn("agm_gpu", &dmsk, sizeof(dmsk)) && dmsk != 0) {
+ 		extern void AgmMaliGPUStart(void);
+diff --git a/bsd/dev/agm_wcn.c b/bsd/dev/agm_wcn.c
+new file mode 100644
+index 000000000..02734d77e
+--- /dev/null
++++ b/bsd/dev/agm_wcn.c
+@@ -0,0 +1,430 @@
++/*
++ * AGM H6 Wi-Fi, step 1: start the integrated Marlin3 WCN (UMS9230 "wcn_btwf") and wait until its
++ * Cortex-M firmware says it is up. Nothing talks to it yet (SIPC and the sc2355 commands come next).
++ *
++ * After the vendor driver (Realme C53 kernel, drivers/unisoc_platform/sprdwcn/boot/wcn_integrate*.c,
++ * wcn_proc_native_start for the BTWF system, first system on, GNSS left off) and this phone's FDT
++ * node wcn_btwf:
++ *   firmware  /odm/firmware/wcnmodem.bin (a plain image, no BTHD signature header), dropped into
++ *             the iOS root as AGM_WCN_FW, copied to DDR 0x87000000 (reserved-memory wcn-mem, 8 MiB,
++ *             below xnu's RAM which starts at 4 GiB); the CP sees it at its address 0.
++ *   sync      shared words at +0x7fdc00 (qogirl6_wcn_special_share_mem): init_status 0x5a5a5a5a
++ *             before the start, the CP writes 0xf0f0f0ff when ready, the AP then 0x13579bdf;
++ *             efuse words at +0x20 (cache eFuse 0x65014c24, then 0x22222222, 0x33333333 as the
++ *             vendor does when the cells are missing), wifi calibration data at +0x2c (all zero:
++ *             not calibrated yet) and its flag at +0xf7c (0xefeffefe: calibrate, 0x12345678 after).
++ *   power     SC2730 LDOs (regulator base 0x1800; PD bit 0 set = off): dcxo1v8 = VDDSIM2 1.8 V,
++ *             vddwcn = VDDWCN 1.2 V, vddwifipa = VDDWIFIPA 3.3 V (what Android has them at);
++ *             the Merlion RF chip: GPIO 118 chip enable, GPIO 117 reset (released high).
++ *   registers set/clear aliases at +0x1000/+0x2000:
++ *             AON APB 0x64000000, PMU APB 0x64020000, PUB APB 0x60000000,
++ *             WCN AON APB 0x5180c000, WCN AON AHB 0x51880000, WCN BTWF AHB 0x51130000.
++ * The WCN registers answer only while the WCN system is powered and awake (the bus hangs
++ * otherwise), so they are touched only after the PMU says so.
++ *
++ * The CP also uses the mailbox at 0x641c0000, whose clock (AON APB 0x04 bit 2) is set here.
++ *
++ * Boot-arg agm_wcn=1 starts it; bit 1 (agm_wcn=3) leaves out the "WCN may sleep" step; bit 2 (agm_wcn=5)
++ * waits 20 s and dumps the CP's memory after 1 s and at the end (sweet_ufs_dump: iosroot + 33 GiB).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern vnode_t rootvnode;
++extern bool agm_pmic_rd(uint32_t reg, uint32_t *val);
++extern bool agm_pmic_wr(uint32_t reg, uint32_t val);
++extern void agm_gpio_out(unsigned n, int value);
++extern void IOSleep(unsigned int milliseconds);
++extern int sweet_ufs_dump(uint64_t off, const void *src, uint64_t len);
++void agm_wcn_start(void);
++
++#define AGM_WCN_FW              "/usr/lib/agm-wcnmodem.bin"
++#define WCN_DDR_PA              0x87000000UL
++#define WCN_DDR_SIZE            0x800000UL
++#define WCN_IMG_WIN             0x200000u       /* mapped: the image window ... */
++#define WCN_TAIL                0x7fc000u       /* ... and the last 16 KiB (AP/CP words) */
++#define WCN_FW_MAX              0x200000u       /* sprd,file-length */
++#define WCN_SYNC                0x7fdc00u       /* sprd,apcp-sync-addr */
++#define SYNC_INIT_STATUS        0x00
++#define SYNC_CP2_SLEEP          0x10
++#define SYNC_SLEEP_FLAG         0x14
++#define SYNC_TEMPER_MAGIC       0x18
++#define SYNC_EFUSE              0x20
++#define SYNC_CALI_DATA          0x2c
++#define SYNC_CALI_FLAG          0xf7c
++#define CP_INIT_START           0x5a5a5a5au
++#define CP_INIT_READY           0xf0f0f0ffu     /* UMW2631_MARLIN_CP_INIT_READY_MAGIC */
++#define CP_INIT_SUCCESS         0x13579bdfu
++#define CP_INIT_FAILED          0x88888888u
++#define CALI_FLAG_DO            0xefeffefeu
++#define CALI_FLAG_DONE          0x12345678u
++#define EFUSE_TEMPER_MAGIC      0x432ff678u
++
++#define AON_APB_PA              0x64000000UL
++#define PMU_APB_PA              0x64020000UL
++#define PUB_APB_PA              0x60000000UL
++#define WCN_AON_APB_PA          0x5180c000UL
++#define WCN_AON_AHB_PA          0x51880000UL
++#define WCN_BTWF_AHB_PA         0x51130000UL
++#define CACHE_EFUSE_PA          0x65014c00UL
++#define REG_SET                 0x1000
++#define REG_CLR                 0x2000
++
++#define LDO_WR_PROT             0x1bd0          /* 0x1800 + 0x3d0 */
++#define LDO_WR_UNLOCK           0x6e7f
++#define LDO_VDDWCN_PD           0x191c
++#define LDO_VDDWCN_VOL          0x1920          /* 900 mV + 15 mV steps, 6 bits */
++#define LDO_VDDSIM2_PD          0x1994
++#define LDO_VDDSIM2_VOL         0x1998          /* 1200 mV + 10 mV steps, 8 bits */
++#define LDO_VDDWIFIPA_PD        0x19d0
++#define LDO_VDDWIFIPA_VOL       0x19d4          /* 1200 mV + 10 mV steps, 8 bits */
++
++#define GPIO_MERLION_RST        117
++#define GPIO_MERLION_EN         118
++
++static vm_offset_t aon, pmu, pub, waonapb, waonahb, wbtwf, ddr, tail;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	return *(volatile uint32_t *)(b + off);
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++/* the WCN region is mapped in two pieces (one 8 MiB mapping fails: kmem_alloc returns 3) */
++static vm_offset_t
++dp(uint32_t off)
++{
++	return off >= WCN_TAIL ? tail + (off - WCN_TAIL) : ddr + off;
++}
++
++static void
++ddr_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)dp(off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static uint32_t
++ddr_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)dp(off);
++}
++
++/* the vendor's polls: three equal reads in a row, up to 256 tries ~100 us apart */
++static bool
++poll(vm_offset_t b, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (int i = 0; i < 256; i++) {
++		int ok = 0;
++		for (int k = 0; k < 3 && (rd(b, off) & mask) == want; k++) {
++			ok++;
++		}
++		if (ok == 3) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++/* The CP's memory as it is now (2 MiB image window, then the 16 KiB tail) into the root
++ * partition at 33 GiB + slot * 4 MiB, for reading from Android (sweet_ufs_dump). */
++static void
++dump(unsigned slot)
++{
++	uint32_t n = WCN_IMG_WIN + (WCN_DDR_SIZE - WCN_TAIL);
++	uint32_t *buf = kalloc_data(n, Z_WAITOK);
++
++	if (buf == NULL) {
++		return;
++	}
++	for (uint32_t o = 0; o < WCN_IMG_WIN; o += 4) {
++		buf[o / 4] = rd(ddr, o);
++	}
++	for (uint32_t o = 0; o < WCN_DDR_SIZE - WCN_TAIL; o += 4) {
++		buf[(WCN_IMG_WIN + o) / 4] = rd(tail, o);
++	}
++	printf("AGM WCN: memory dump %u: %d\n", slot, sweet_ufs_dump((uint64_t)slot << 22, buf, n));
++	kfree_data(buf, n);
++}
++
++static void
++show(const char *when)
++{
++	printf("AGM WCN %s: pmu 3a8 %#x 538 %#x 818 %#x 860 %#x; aon 350 %#x 354 %#x 360 %#x 364 %#x\n", when,
++	    rd(pmu, 0x3a8), rd(pmu, 0x538), rd(pmu, 0x818), rd(pmu, 0x860),
++	    rd(aon, 0x350), rd(aon, 0x354), rd(aon, 0x360), rd(aon, 0x364));
++}
++
++static void
++show_wcn(const char *when)
++{
++	printf("AGM WCN %s: waonapb 90 %#x 98 %#x 3b0 %#x 3b4 %#x 3c0 %#x; waonahb c %#x 4c %#x c4 %#x; btwf 410 %#x\n",
++	    when, rd(waonapb, 0x90), rd(waonapb, 0x98), rd(waonapb, 0x3b0), rd(waonapb, 0x3b4), rd(waonapb, 0x3c0),
++	    rd(waonahb, 0x0c), rd(waonahb, 0x4c), rd(waonahb, 0xc4), rd(wbtwf, 0x410));
++}
++
++static void
++ldo_on(const char *name, uint32_t pd, uint32_t vol, uint32_t vmask, uint32_t sel)
++{
++	uint32_t p0 = 0, v0 = 0, p1 = 0, v1 = 0;
++
++	(void)agm_pmic_rd(pd, &p0);
++	(void)agm_pmic_rd(vol, &v0);
++	(void)agm_pmic_wr(LDO_WR_PROT, LDO_WR_UNLOCK);
++	(void)agm_pmic_wr(vol, (v0 & ~vmask) | sel);
++	(void)agm_pmic_wr(pd, p0 & ~1u);
++	delay(100);                                     /* the ADI write FIFO drains first */
++	(void)agm_pmic_rd(pd, &p1);
++	(void)agm_pmic_rd(vol, &v1);
++	printf("AGM WCN: LDO %s pd %#x -> %#x, vol %#x -> %#x\n", name, p0, p1, v0, v1);
++}
++
++/* the firmware, out of the iOS root (there once agm-drop.py has put it there) */
++static uint8_t *
++load_firmware(uint32_t *len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	uint8_t *buf = NULL;
++	int error = ENOENT, resid = 0;
++
++	for (int i = 0; i < 180 && (rootvnode == NULLVP || (error = vnode_open(AGM_WCN_FW, FREAD, 0, 0, &vp, ctx)) != 0); i++) {
++		IOSleep(1000);
++	}
++	if (error != 0) {
++		printf("AGM WCN: no %s (%d)\n", AGM_WCN_FW, error);
++		return NULL;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) == 0 && va.va_data_size > 0x1000 && va.va_data_size <= WCN_FW_MAX) {
++		*len = (uint32_t)va.va_data_size;
++		buf = kalloc_data(*len, Z_WAITOK);
++	}
++	if (buf != NULL && vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)*len, 0, UIO_SYSSPACE, IO_NOAUTH,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) != 0) {
++		kfree_data(buf, *len);
++		buf = NULL;
++	}
++	vnode_close(vp, FREAD, ctx);
++	if (buf == NULL) {
++		printf("AGM WCN: cannot read %s (size %llu)\n", AGM_WCN_FW, (unsigned long long)va.va_data_size);
++	}
++	return buf;
++}
++
++static void
++agm_wcn_thread(void *arg, __unused wait_result_t wr_)
++{
++	uint32_t flags = (uint32_t)(uintptr_t)arg, len = 0, v, efuse0;
++	uint8_t *fw = load_firmware(&len);
++
++	if (fw == NULL) {
++		return;
++	}
++	aon = ml_io_map(AON_APB_PA, 0x3000);
++	pmu = ml_io_map(PMU_APB_PA, 0x3000);
++	pub = ml_io_map(PUB_APB_PA, 0x11000);
++	waonapb = ml_io_map(WCN_AON_APB_PA, 0x3000);
++	waonahb = ml_io_map(WCN_AON_AHB_PA, 0x3000);
++	wbtwf = ml_io_map(WCN_BTWF_AHB_PA, 0x3000);
++	ddr = ml_io_map_wcomb(WCN_DDR_PA, WCN_IMG_WIN);
++	tail = ml_io_map_wcomb(WCN_DDR_PA + WCN_TAIL, WCN_DDR_SIZE - WCN_TAIL);
++	vm_offset_t efuse = ml_io_map(CACHE_EFUSE_PA, 0x1000);
++	if (!aon || !pmu || !pub || !waonapb || !waonahb || !wbtwf || !ddr || !tail || !efuse) {
++		printf("AGM WCN: map failed\n");
++		goto out;
++	}
++	efuse0 = rd(efuse, 0x24);
++	printf("AGM WCN: firmware %u bytes, reset sp %#x pc %#x; efuse blk0 %#x; pub 8018 %#x\n", len,
++	    ((uint32_t *)fw)[0], ((uint32_t *)fw)[1], efuse0, rd(pub, 0x8018));
++	show("before");
++
++	/* probe-time register (sprd,ctrl-*[0]): PUB APB 0x8018 |= 0x70 */
++	wr(pub, 0x8018 + REG_SET, 0x70);
++	printf("AGM WCN: pub 8018 now %#x\n", rd(pub, 0x8018));
++
++	/* the image and the AP/CP words: the rest of both windows zero */
++	for (uint32_t o = 0; o < WCN_IMG_WIN; o += 8) {
++		*(volatile uint64_t *)(ddr + o) = 0;
++	}
++	for (uint32_t o = 0; o < WCN_DDR_SIZE - WCN_TAIL; o += 8) {
++		*(volatile uint64_t *)(tail + o) = 0;
++	}
++	for (uint32_t o = 0; o < len; o += 4) {
++		uint32_t w = 0;
++		memcpy(&w, fw + o, MIN(4u, len - o));
++		*(volatile uint32_t *)(ddr + o) = w;
++	}
++	ddr_wr(WCN_SYNC + SYNC_INIT_STATUS, CP_INIT_START);
++	ddr_wr(WCN_SYNC + SYNC_CP2_SLEEP, 0);
++	ddr_wr(WCN_SYNC + SYNC_SLEEP_FLAG, 0);
++	ddr_wr(WCN_SYNC + SYNC_EFUSE + 0, efuse0);
++	ddr_wr(WCN_SYNC + SYNC_EFUSE + 4, 0x22222222);
++	ddr_wr(WCN_SYNC + SYNC_EFUSE + 8, 0x33333333);
++	ddr_wr(WCN_SYNC + SYNC_TEMPER_MAGIC, EFUSE_TEMPER_MAGIC + 1);  /* no temperature eFuse */
++	ddr_wr(WCN_SYNC + SYNC_CALI_FLAG, CALI_FLAG_DO);
++	v = 0;
++	for (uint32_t o = 0; o < len; o += 4) {
++		v += rd(ddr, o);
++	}
++	printf("AGM WCN: image in DDR, word sum %#x, first %#x %#x\n", v, rd(ddr, 0), rd(ddr, 4));
++
++	/* the AP<->CP mailbox (0x641c0000) clock, AON APB 0x04 bit 2 (sprd,mailbox_clk; the vendor's
++	 * mailbox driver sets it at probe): without it the CP's mailbox init bus-faults */
++	wr(aon, 0x04 + REG_SET, 1u << 2);
++	printf("AGM WCN: aon 4 (mailbox clock) %#x\n", rd(aon, 0x04));
++
++	/* GNSS stays shut down (gnss_shutdown_hold) */
++	wr(aon, 0x350 + REG_SET, (1u << 7) | (1u << 22) | (1u << 23));
++
++	/* power and clock for the WCN system (wcn_power_clock_support) */
++	ldo_on("dcxo1v8/vddsim2", LDO_VDDSIM2_PD, LDO_VDDSIM2_VOL, 0xff, 60);
++	delay(15);
++	ldo_on("vddwcn", LDO_VDDWCN_PD, LDO_VDDWCN_VOL, 0x3f, 20);
++	delay(15);
++	agm_gpio_out(GPIO_MERLION_EN, 1);
++	delay(500);
++	agm_gpio_out(GPIO_MERLION_RST, 0);
++	delay(500);
++	agm_gpio_out(GPIO_MERLION_RST, 1);
++	delay(15);
++	IOSleep(2);
++	ldo_on("vddwifipa", LDO_VDDWIFIPA_PD, LDO_VDDWIFIPA_VOL, 0xff, 210);
++
++	/* wcn_sys_power_up: PMU delay counts, auto shutdown off, force shutdown off */
++	wr(pmu, 0x3a8 + REG_CLR, 0xffffu << 8);
++	wr(pmu, 0x3a8 + REG_SET, 0x0204u << 8);
++	wr(pmu, 0x3a8 + REG_CLR, 1u << 24);
++	wr(pmu, 0x3a8 + REG_CLR, 1u << 25);
++	if (!poll(pmu, 0x538, 0x1fu << 24, 0)) {
++		show("power-on timeout");
++		goto out;
++	}
++	wr(pmu, 0x818 + REG_CLR, 1u << 7);              /* force deep sleep off */
++	if (!poll(pmu, 0x860, 0xfu << 28, 0x6u << 28)) {
++		show("wakeup timeout");
++		goto out;
++	}
++	IOSleep(8);                                     /* XTL, PLL1, PLL2 settle */
++	printf("AGM WCN: btwf wakeup %d poweron %d\n", poll(aon, 0x364, 0xfu << 7, 0x6u << 7),
++	    poll(aon, 0x360, 0x1fu << 25, 0));
++	show("powered");
++	show_wcn("powered");
++
++	/* pll1_pll2_stable_time */
++	wr(waonapb, 0x3c8, rd(waonapb, 0x3c8) | (0x1458u << 12));
++	wr(waonapb, 0x3c4, rd(waonapb, 0x3c4) | (0x1458u << 12));
++	wr(waonapb, 0x3cc, rd(waonapb, 0x3cc) | (0x1458u << 12));
++	wr(waonapb, 0x19c, rd(waonapb, 0x19c) | (0x37u << 16));
++	wr(waonapb, 0x168, rd(waonapb, 0x168) | (0x7u << 16));
++
++	/* wcn_sys_allow_deep_sleep */
++	if (!(flags & 2)) {
++		wr(waonapb, 0x90, rd(waonapb, 0x90) | (1u << 30));
++		wr(waonahb, 0xc4, 0xffffffffu);
++	}
++
++	/* btwf_sys_poweron: CPU held in reset, BTWF out of force shutdown/deep sleep, then run */
++	wr(waonahb, 0x0c, rd(waonahb, 0x0c) | 0x55);
++	wr(waonapb, 0x98, rd(waonapb, 0x98) & ~(1u << 3));
++	wr(waonapb, 0x98, rd(waonapb, 0x98) & ~(1u << 12));
++	wr(waonapb, 0x98, rd(waonapb, 0x98) & ~(1u << 2));
++	wr(aon, 0x354 + REG_CLR, 0xffffffffu);
++	printf("AGM WCN: btwf sys wakeup %d poweron %d\n", poll(aon, 0x364, 0xfu << 7, 0x6u << 7),
++	    poll(aon, 0x360, 0x1fu << 25, 0));
++	wr(wbtwf, 0x410, rd(wbtwf, 0x410) | (0x3u << 24));
++	wr(waonahb, 0x4c, WCN_SYNC);
++	show_wcn("before release");
++	wr(waonahb, 0x0c, rd(waonahb, 0x0c) & ~0x55u);
++
++	/* wcn_wait_marlin_boot: up to 512 x 9 ms (the vendor's); with agm_wcn bit 2, 20 s and memory dumps */
++	v = 0;
++	int i, wait = (flags & 4) ? 2200 : 512;
++	uint32_t last = CP_INIT_START;
++	for (i = 0; i < wait && (v = ddr_rd(WCN_SYNC + SYNC_INIT_STATUS)) != CP_INIT_READY; i++) {
++		if (i % 64 == 0 || v != last) {
++			printf("AGM WCN: waiting %d ms, init_status %#x\n", i * 9, v);
++			last = v;
++		}
++		if ((flags & 4) && i == 111) {
++			dump(0);
++		}
++		IOSleep(9);
++	}
++	if (flags & 4) {
++		dump(1);
++	}
++	show("after");
++	/* once running, the WCN sleeps whenever it likes (its registers then hang the bus): only the PMU's
++	 * and AON's view of it from here on */
++	{
++		uint32_t pw = 0, pc = 0, pa = 0, changed = 0, first = 0, beyond = 0, fb = 0, tl = 0;
++		(void)agm_pmic_rd(LDO_VDDWCN_PD, &pc);
++		(void)agm_pmic_rd(LDO_VDDSIM2_PD, &pw);
++		(void)agm_pmic_rd(LDO_VDDWIFIPA_PD, &pa);
++		/* did the CP run at all: words of the image it changed, words past it it wrote */
++		for (uint32_t o = 0; o + 4 <= len; o += 4) {
++			if (rd(ddr, o) != ((uint32_t *)fw)[o / 4] && changed++ == 0) {
++				first = o;
++			}
++		}
++		for (uint32_t o = (len + 3) & ~3u; o < WCN_IMG_WIN; o += 4) {
++			if (rd(ddr, o) != 0 && beyond++ == 0) {
++				fb = o;
++			}
++		}
++		for (uint32_t o = 0; o < WCN_DDR_SIZE - WCN_TAIL; o += 4) {
++			tl += rd(tail, o) != 0;
++		}
++		printf("AGM WCN: ldo pd wcn %#x sim2 %#x wifipa %#x; pub 8018 %#x; image words changed %u (first +%#x), "
++		    "written past it %u (first +%#x), tail nonzero %u\n", pc, pw, pa, rd(pub, 0x8018), changed, first,
++		    beyond, fb, tl);
++	}
++	if (v != CP_INIT_READY) {
++		printf("AGM WCN: CP not ready, init_status %#x\n", v);
++		ddr_wr(WCN_SYNC + SYNC_INIT_STATUS, CP_INIT_FAILED);
++		goto out;
++	}
++	ddr_wr(WCN_SYNC + SYNC_CALI_FLAG, CALI_FLAG_DONE);
++	ddr_wr(WCN_SYNC + SYNC_INIT_STATUS, CP_INIT_SUCCESS);
++	printf("AGM WCN: CP ready after %d ms; loopcheck %#x, cp2 sleep %#x\n", i * 9,
++	    ddr_rd(WCN_SYNC + 4), ddr_rd(WCN_SYNC + SYNC_CP2_SLEEP));
++out:
++	kfree_data(fw, len);
++}
++
++void
++agm_wcn_start(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (PE_parse_boot_argn("agm_wcn", &on, sizeof(on)) && on != 0 &&
++	    kernel_thread_start(agm_wcn_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_AGM */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a30221b23..fabf40f97 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -438,6 +438,35 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 	return ENOENT;
+ }
+ 
++#define SWEET_DUMP_OFF          (33ull << 30)
++#define SWEET_DUMP_MAX          (64ull << 20)
++int sweet_ufs_dump(uint64_t off, const void *src, uint64_t len);
++/* len bytes at 33 GiB + off of the root partition (block aligned, at most 64 MiB in all) */
++int
++sweet_ufs_dump(uint64_t off, const void *src, uint64_t len)
++{
++	int error = 0;
++
++	if (!su.ready || !su.writable || off % UFS_BLOCK || off > SWEET_DUMP_MAX || len > SWEET_DUMP_MAX - off ||
++	    su.nblocks * UFS_BLOCK < SWEET_DUMP_OFF + SWEET_DUMP_MAX + (64ull << 20)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (uint64_t done = 0; !error && done < len;) {
++		uint32_t n = (uint32_t)MIN(len - done, (uint64_t)BOUNCE_SIZE);
++		uint32_t blocks = (n + UFS_BLOCK - 1) / UFS_BLOCK;
++		bzero((void *)(su.dma + DMA_BOUNCE), blocks * UFS_BLOCK);
++		memcpy((void *)(su.dma + DMA_BOUNCE), (const uint8_t *)src + done, n);
++		error = ufs_write_blocks(su.first_block + (SWEET_DUMP_OFF + off + done) / UFS_BLOCK, blocks);
++		done += n;
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+ int
+ sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)

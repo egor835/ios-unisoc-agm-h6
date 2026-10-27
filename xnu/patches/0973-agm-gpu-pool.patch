@@ -1,0 +1,269 @@
+agm-0973: AGM H6 GPU pool. The ADT gives the kernel 4.75 GB (mkadt.py AGM_MEM_SIZE 0x130000000);
+the top 1.25 GB of DRAM (0x2_30000000-0x2_80000000) is TopazAdreno.cpp's GPU pool on AGM,
+write-combined and never in the processors' caches. AgmMaliGPU takes Mesa's buffers from it
+(cached buffers only for the tiler heap and when the pool is full), SweetSurface the window
+server's screen-sized surfaces (agm_gpu=1, 720x1600 and up); neither is flushed at submissions
+nor invalidated before the display shows it. SweetFramebuffer shows pool frames directly only
+where there is an MDP (fCtl0; NULL on AGM: data abort at 0x18), else copies them.
+AgmMaliGPU logs flush statistics every 5 s.
+
+diff --git a/iokit/Kernel/arm/AgmMaliGPU.cpp b/iokit/Kernel/arm/AgmMaliGPU.cpp
+index 1d8cad433..966559839 100644
+--- a/iokit/Kernel/arm/AgmMaliGPU.cpp
++++ b/iokit/Kernel/arm/AgmMaliGPU.cpp
+@@ -8,10 +8,11 @@
+  * in and back (userland: redwood-drm built for panfrost). mmap() of a buffer is the client
+  * memory of the type that is the buffer's handle. The hardware is AgmMali.cpp.
+  *
+- * Buffers: wired kernel memory, ordinary cached memory in the kernel and in programs (the GPU
+- * is not coherent with the processors, and write-combined allocations are broken here: see
+- * createBo()): zeroed and pushed out of the caches when made, and pushed out again at every
+- * submission that names it once the program has mapped it, like topaz's gpu_cached=1.
++ * Buffers: from the GPU pool (TopazAdreno.cpp's, at 0x2_30000000 on AGM: RAM the kernel does
++ * not manage), write-combined in the kernel and in programs, so the processors' caches never
++ * hold any of it (the GPU is not coherent with them). The heap, and buffers the pool has no
++ * room for, are ordinary cached memory pushed out of the caches when made and at every
++ * submission once mapped (write-combined IOBMD allocations get addresses outside RAM here).
+  * Entered page by page into the GPU's address space at an address chosen here
+  * (32 MB - 4 GB). A heap buffer (PANFROST_BO_HEAP, the tiler heap) gets all its memory at
+  * once instead of on GPU faults; nobody maps it.
+@@ -63,6 +64,11 @@ bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
+ void agm_mali_init(void);
+ 
+ void AgmMaliGPUStart(void);
++
++/* TopazAdreno.cpp's GPU pool, at AGM's addresses: RAM the kernel does not manage, write-combined */
++uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
++IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+ }
+ 
+ #define AGM_MALI_MAP_RO         1u
+@@ -140,6 +146,10 @@ struct agm_surface {
+ #define GPU_PATIENCE_MS         5000
+ 
+ static IOLock *gLock;
++static struct {
++	uint64_t since, flushing, flushed;
++	uint32_t submissions;
++} gStat;                                        /* the last five seconds' submissions, for the log */
+ 
+ struct gpu_buffer {
+ 	IOMemoryDescriptor *memory;             /* NULL: this handle is free */
+@@ -149,6 +159,7 @@ struct gpu_buffer {
+ 	uint32_t flags;
+ 	bool seen;                              /* mapped by the program */
+ 	bool cached;                            /* ordinary cached memory: pushed out of the caches at submissions */
++	uint64_t pool;                          /* physical address in the GPU pool (write-combined), 0: not from it */
+ 	uint64_t seqno;                         /* the last submission that names it */
+ };
+ 
+@@ -267,6 +278,10 @@ AgmMaliGPUUserClient::freeBuffer(struct gpu_buffer *b)
+ 	agm_mali_va_free(b->address, b->size);
+ 	OSSafeReleaseNULL(b->memory);
+ 	OSSafeReleaseNULL(b->surface);
++	if (b->pool != 0) {
++		topaz_gpu_pool_free(b->pool, b->size);
++		b->pool = 0;
++	}
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+ }
+@@ -362,7 +377,6 @@ IOReturn
+ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ {
+ 	uint64_t size = round_page_64(r->size);
+-	IOBufferMemoryDescriptor *memory;
+ 	struct gpu_buffer *b;
+ 	bool heap = (r->flags & PANFROST_BO_HEAP) != 0;
+ 
+@@ -370,35 +384,59 @@ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	/*
+-	 * Ordinary cached memory: write-combined (or contiguous) IOBMD allocations get physical
+-	 * addresses outside RAM in this kernel (the top bit lost: phystokv panic), whatever the
+-	 * mask. What programs write through their mappings is pushed out of the processors'
+-	 * caches at every submission that names the buffer (submit()); the heap only the GPU uses.
++	 * From the GPU pool (RAM the kernel does not manage, write-combined for the kernel and for
++	 * programs alike: nothing of it is ever in the processors' caches). The heap, which only
++	 * the GPU uses, and buffers the pool has no room for are ordinary cached memory (write-
++	 * combined IOBMD allocations get physical addresses outside RAM here), zeroed and pushed
++	 * out of the caches now, and again at every submission once a program has mapped them.
+ 	 */
+-	bool cached = true;
+-	memory = NULL;
+-	if (memory == NULL) {
+-		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+-		    (vm_size_t)size, PAGE_SIZE);
++	IOMemoryDescriptor *memory = NULL;
++	void *va = NULL;
++	uint64_t pool = heap ? 0 : topaz_gpu_pool_alloc(size, &va);
++	if (pool != 0) {
++		memory = topaz_gpu_pool_md(pool, size);
++		if (memory == NULL) {
++			topaz_gpu_pool_free(pool, size);
++			pool = 0;
++		} else {
++			for (uint64_t i = 0; i < size; i += 8) {
++				*(volatile uint64_t *)((uint8_t *)va + i) = 0;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
+ 	}
+ 	if (memory == NULL) {
+-		IOLog("AgmMaliGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount,
+-		    fBufferBytes >> 20);
+-		return kIOReturnNoMemory;
++		IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)size, PAGE_SIZE);
++		if (bmd == NULL) {
++			IOLog("AgmMaliGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount,
++			    fBufferBytes >> 20);
++			return kIOReturnNoMemory;
++		}
++		va = bmd->getBytesNoCopy();
++		bzero(va, (size_t)size);
++		sweet_dcache_flush((vm_offset_t)va, (unsigned)size);
++		memory = bmd;
++		static uint32_t told;
++		if (!heap && told++ < 4) {
++			IOLog("AgmMaliGPU: the GPU pool has no %llu bytes: a cached buffer\n", size);
++		}
+ 	}
+-	bzero(memory->getBytesNoCopy(), (size_t)size);
+-	sweet_dcache_flush((vm_offset_t)memory->getBytesNoCopy(), (unsigned)size);
+ 	IOLockLock(gLock);
+ 	b = newBuffer(memory, size, r->flags | (heap ? PANFROST_BO_NOEXEC : 0), &r->handle);
+ 	if (b != NULL) {
+ 		b->memory = memory;
+-		b->kernel = (uint8_t *)memory->getBytesNoCopy();
+-		b->cached = cached && !heap;
++		b->kernel = (uint8_t *)va;
++		b->cached = pool == 0 && !heap;
++		b->pool = pool;
+ 		r->offset = b->address;
+ 	}
+ 	IOLockUnlock(gLock);
+ 	if (b == NULL) {
+ 		memory->release();
++		if (pool != 0) {
++			topaz_gpu_pool_free(pool, size);
++		}
+ 		return kIOReturnNoMemory;
+ 	}
+ 	return kIOReturnSuccess;
+@@ -495,13 +533,16 @@ AgmMaliGPUUserClient::submit(struct pan_submit *r)
+ 		}
+ 	}
+ 	IOLockLock(gLock);
+-	/* surfaces are cached memory: what the processors wrote goes out to memory, what they hold goes */
++	uint64_t began = mach_absolute_time();
++	/* cached memory: what the processors wrote goes out to memory, what they hold goes */
+ 	for (uint32_t i = 0; i < r->bo_handle_count; i++) {
+ 		struct gpu_buffer *b = buffer(handles[i]);
+-		if (b != NULL && (b->surface != NULL || (b->cached && b->seen))) {
++		if (b != NULL && ((b->surface != NULL && !b->surface->gpuPool) || (b->cached && b->seen))) {
+ 			sweet_dcache_flush((vm_offset_t)b->kernel, (unsigned)b->size);
++			gStat.flushed += b->size;
+ 		}
+ 	}
++	gStat.flushing += mach_absolute_time() - began;
+ 	seqno = agm_mali_submit(r->jc, r->requirements);
+ 	for (uint32_t i = 0; seqno != 0 && i < r->bo_handle_count; i++) {
+ 		struct gpu_buffer *b = buffer(handles[i]);
+@@ -516,6 +557,21 @@ AgmMaliGPUUserClient::submit(struct pan_submit *r)
+ 	if (handles != NULL) {
+ 		IODelete(handles, uint32_t, r->bo_handle_count);
+ 	}
++	gStat.submissions++;
++	if (gStat.since == 0) {
++		gStat.since = began;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - gStat.since, &ns);
++	if (ns >= 5 * NSEC_PER_SEC) {
++		uint64_t flushing;
++		absolutetime_to_nanoseconds(gStat.flushing, &flushing);
++		IOLog("AgmMaliGPU: %u submissions in %llu ms; %llu KB out of the caches in %llu us a submission; "
++		    "%u buffers (%llu MB) with this client\n", gStat.submissions, ns / NSEC_PER_MSEC,
++		    (gStat.flushed >> 10) / gStat.submissions, flushing / NSEC_PER_USEC / gStat.submissions, fBufferCount,
++		    fBufferBytes >> 20);
++		bzero(&gStat, sizeof(gStat));
++	}
+ 	if (fSubmits++ < 4) {
+ 		IOLog("AgmMaliGPU: submission %llu: chain at %#llx, %u buffers, requirements %#x\n", seqno, r->jc,
+ 		    r->bo_handle_count, r->requirements);
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 3e55b906f..ddfa0c0f6 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -240,7 +240,7 @@ topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds)
+ 	if (!agm_mali_wait(fence, milliseconds)) {
+ 		return false;
+ 	}
+-	if (surface->kernelAddress() != 0) {
++	if (!surface->gpuPool && surface->kernelAddress() != 0) {    /* (pool memory is never in the caches) */
+ 		sweet_dcache_flush((vm_offset_t)surface->kernelAddress(), surface->allocSize);
+ 	}
+ 	(void)__sync_bool_compare_and_swap(&surface->drawn, fence, 0);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 30036b154..144797bee 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -865,7 +865,8 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++	/* (only where the MDP scans surfaces itself: on AGM, fCtl0 == NULL, frames are copied) */
++	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown && fCtl0 != NULL;
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a4e..7a8dc65ae 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -495,14 +495,22 @@ sweet_gpu_pool_eligible(const SweetSurface *s)
+ 	static int gpu = -1;
+ 	if (gpu < 0) {
+ 		uint32_t on = 0;
++#if defined(SWEET_AGM)
++		gpu = PE_parse_boot_argn("agm_gpu", &on, sizeof(on)) && on != 0;
++#else
+ 		gpu = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
++#endif
+ 		uint32_t pool = 1;
+ 		if (PE_parse_boot_argn("gpu_fbpool", &pool, sizeof(pool)) && pool == 0) {
+ 			gpu = 0;
+ 		}
+ 	}
+ 	if (!(gpu && s->bytesPerElement == 4 && s->planeCount <= 1 && s->elementWidth == 1 && s->elementHeight == 1 &&
++#if defined(SWEET_AGM)
++	    s->width >= 720 && s->height >= 1600 && s->allocSize <= (48u << 20))) {
++#else
+ 	    s->width >= 1000 && s->height >= 2000 && s->allocSize <= (48u << 20))) {
++#endif
+ 		return false;
+ 	}
+ 	/* only the window server's own (the display's frames); applications' screen-sized surfaces came out black */
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336d6..ba50841fa 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -159,8 +159,14 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * reserved regions in the stock DT, not given to the kernel): a pool of it is
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
++#if defined(SWEET_AGM)
++/* AGM H6: the top 1.25 GB of DRAM, outside the kernel's RAM (mkadt.py AGM_MEM_SIZE); the Mali reaches it */
++#define GPU_POOL_BASE       0x230000000ull
++#define GPU_POOL_SIZE       0x50000000ull
++#else
+ #define GPU_POOL_BASE       0x90000000ull
+ #define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
++#endif
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)

@@ -1,0 +1,50 @@
+agm-0972: AGM H6 secondaries through the shim's trampoline below 4 GB: the firmware's PSCI
+CPU_ON refuses entry points above 4 GB (rc -9) and xnu lives above 4 GB. The shim adds
+agm_tramp=<pa> to the boot-args (start.S xnu_secondary_tramp: EL2 -> EL1h, then a branch to
+the 64-bit address in its slot 0x40 bytes before it); SweetCPU writes sweet_secondary_entry's
+physical address there through an uncached mapping and points CPU_ON at the trampoline.
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 789cb9f6c..69e7cb61e 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -19,6 +19,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ 
+ class SweetCPU;
+@@ -255,6 +256,31 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++#if defined(SWEET_AGM)
++	/*
++	 * AGM H6: CPU_ON takes no entry point above 4 GB (rc -9). The shim's trampoline below
++	 * 4 GB (boot-arg agm_tramp) drops the core to EL1h and branches to the address in its
++	 * slot 0x40 bytes before it, written here through an uncached mapping (the core reads it with the
++	 * MMU and caches off).
++	 */
++	static uint32_t agm_tramp;
++	static volatile uint64_t *agm_tramp_slot;
++	if (agm_tramp_slot == NULL && PE_parse_boot_argn("agm_tramp", &agm_tramp, sizeof(agm_tramp)) &&
++	    agm_tramp != 0 && (agm_tramp & 0x3f) == 0) {
++		uint32_t slot = agm_tramp - 0x40;
++		vm_offset_t page = ml_io_map(slot & ~0x3fffU, 0x4000);
++		if (page != 0) {
++			agm_tramp_slot = (volatile uint64_t *)(page + (slot & 0x3fffU));
++		}
++	}
++	if (agm_tramp_slot != NULL) {
++		*agm_tramp_slot = (uint64_t)entry;
++		__builtin_arm_dsb(DSB_SY);
++		IOLog("SWEET CPU: cpu=%u through the trampoline at 0x%x to 0x%llx\n", getCPUNumber(), agm_tramp,
++		    (uint64_t)entry);
++		entry = agm_tramp;
++	}
++#endif
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);

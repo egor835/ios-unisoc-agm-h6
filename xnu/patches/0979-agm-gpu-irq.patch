@@ -1,0 +1,175 @@
+agm-0979: AGM H6 Mali interrupts. SPI 60 (INTID 92) is set up in the GIC
+distributor (Group 1, level, to CPU 0) and handed by sleh_irq() to agm_irq_hook (AgmMali.cpp):
+the handler masks the Mali's interrupts and wakes the waiters, check() does the work under the
+lock and unmasks them. Waits for a job sleep until then instead of polling every 20 us (and look
+again every 200 us in case an interrupt goes astray). Boot-arg agm_gpu_irq=0: polling as before.
+
+
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+index 96e5273a9..3d404cf04 100644
+--- a/iokit/Kernel/arm/AgmMali.cpp
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -204,6 +204,20 @@ static uint64_t jobs_done, jobs_failed;
+ static uint64_t busy_abs, busy_jobs;           /* since agm_mali_busy() was last asked: the GPU at work (as seen here) */
+ static thread_t kick_thread;
+ 
++/*
++ * Interrupts (boot-arg agm_gpu_irq, default 1): the Mali's JOB/MMU/GPU line is SPI 60 (INTID 92),
++ * routed by the distributor (GICD 0x10000000) to CPU 0 in Group 1; osfmk/arm64/sleh.c hands it to
++ * agm_mali_irq() through agm_irq_hook. The handler only masks the Mali's interrupts and wakes
++ * whoever waits on irq_event; check() then does the work under hw_lock and unmasks them. A wait
++ * still looks again every IRQ_PATIENCE_US in case an interrupt goes astray.
++ */
++#define MALI_INTID              92
++#define IRQ_PATIENCE_US         200
++extern "C" int (*agm_irq_hook)(uint32_t intid);
++static bool irq_on;
++static uint32_t irq_event;
++static volatile uint64_t irq_count;
++
+ static inline uint32_t
+ rd(uint32_t o)
+ {
+@@ -716,7 +730,7 @@ recover(const char *why)
+ 
+ /* With hw_lock held: has the running job ended? Then the next one starts. */
+ static void
+-check(void)
++check_jobs(void)
+ {
+ 	if (running_seqno == 0) {
+ 		start_next();
+@@ -755,6 +769,54 @@ check(void)
+ 	}
+ }
+ 
++static void
++check(void)
++{
++	check_jobs();
++	if (irq_on && !broken) {
++		wr(JOB_INT_MASK, 0x70007);              /* slots 0-2: done, failed */
++		wr(MMU_INT_MASK, 0x1);                  /* AS 0 */
++	}
++}
++
++static int
++agm_mali_irq(uint32_t intid)
++{
++	if (intid != MALI_INTID || mali == NULL) {
++		return 0;
++	}
++	*(volatile uint32_t *)(mali + JOB_INT_MASK) = 0;
++	*(volatile uint32_t *)(mali + MMU_INT_MASK) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	irq_count++;
++	thread_wakeup((event_t)&irq_event);
++	return 1;
++}
++
++/* The distributor: INTID 92 in Group 1, level, priority 0xa0, to CPU 0 (MPIDR 0), enabled. */
++static bool
++irq_setup(void)
++{
++	volatile uint8_t *d = (volatile uint8_t *)ml_io_map(0x10000000, 0x10000);
++	uint32_t n = MALI_INTID;
++
++	if (d == NULL) {
++		return false;
++	}
++	uint32_t ctlr = *(volatile uint32_t *)(d + 0x0), typer = *(volatile uint32_t *)(d + 0x4);
++	*(volatile uint32_t *)(d + 0x80 + (n / 32) * 4) |= 1u << (n % 32);             /* IGROUPR: Group 1 */
++	*(volatile uint8_t *)(d + 0x400 + n) = 0xa0;                                    /* IPRIORITYR */
++	*(volatile uint32_t *)(d + 0xc00 + (n / 16) * 4) &= ~(2u << ((n % 16) * 2));    /* ICFGR: level */
++	*(volatile uint64_t *)(d + 0x6000 + n * 8) = 0;                                 /* IROUTER: CPU 0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	agm_irq_hook = agm_mali_irq;
++	*(volatile uint32_t *)(d + 0x100 + (n / 32) * 4) = 1u << (n % 32);              /* ISENABLER */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLog("AGM MALI: interrupts: GICD ctlr %#x typer %#x, INTID %u enabled %u\n", ctlr, typer, n,
++	    (*(volatile uint32_t *)(d + 0x100 + (n / 32) * 4) >> (n % 32)) & 1);
++	return true;
++}
++
+ /* requirements: panfrost's (bit 0 PANFROST_JD_REQ_FS). 0: no room or no GPU. */
+ uint64_t
+ agm_mali_submit(uint64_t jc, uint32_t requirements)
+@@ -802,6 +864,10 @@ agm_mali_busy(uint64_t *ns, uint64_t *jobs)
+ 	busy_abs = 0;
+ 	busy_jobs = 0;
+ 	IOLockUnlock(hw_lock);
++	static uint64_t last_irqs;
++	uint64_t irqs = irq_count;
++	IOLog("AGM MALI: %llu interrupts since the last report%s\n", irqs - last_irqs, irq_on ? "" : " (polling)");
++	last_irqs = irqs;
+ }
+ 
+ uint64_t
+@@ -820,7 +886,13 @@ agm_mali_wait(uint64_t seqno, uint64_t milliseconds)
+ 		if (mach_absolute_time() - began >= patience) {
+ 			return false;
+ 		}
+-		delay_for_interval(WAIT_POLL_US, NSEC_PER_USEC);
++		/* asleep until the GPU's interrupt (or a short while, if there is none) */
++		assert_wait_timeout((event_t)&irq_event, THREAD_UNINT, irq_on ? IRQ_PATIENCE_US : WAIT_POLL_US, NSEC_PER_USEC);
++		if (*(volatile uint64_t *)&done_seqno >= seqno) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			continue;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ 	return !broken;
+ }
+@@ -837,7 +909,8 @@ kick_loop(void *arg, wait_result_t w)
+ 		bool busy = running_seqno != 0 || ring_count != 0;
+ 		IOLockUnlock(hw_lock);
+ 		if (busy) {
+-			delay_for_interval(WAIT_POLL_US, NSEC_PER_USEC);
++			assert_wait_timeout((event_t)&irq_event, THREAD_UNINT, irq_on ? 1000 : WAIT_POLL_US, NSEC_PER_USEC);
++			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+ 			assert_wait_timeout(&ring_count, THREAD_UNINT, 100, NSEC_PER_MSEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+@@ -915,6 +988,14 @@ agm_mali_init(void)
+ 		return;
+ 	}
+ 	ready = true;
++	uint32_t want_irq = 1;
++	(void)PE_parse_boot_argn("agm_gpu_irq", &want_irq, sizeof(want_irq));
++	if (want_irq && irq_setup()) {
++		irq_on = true;
++		IOLockLock(hw_lock);
++		check();                                /* (unmasks) */
++		IOLockUnlock(hw_lock);
++	}
+ 	if (kernel_thread_start(kick_loop, NULL, &kick_thread) == KERN_SUCCESS) {
+ 		thread_deallocate(kick_thread);
+ 	} else {
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a2a8c1b1b..b1892044b 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1925,6 +1925,10 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET_AGM)
++int (*agm_irq_hook)(uint32_t intid);
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1960,6 +1964,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++#if defined(SWEET_AGM)
++		/* AGM H6: the devices whose drivers take their own interrupts (AgmMali.cpp) */
++		if (agm_irq_hook != NULL && agm_irq_hook(intid)) {
++			/* handled */
++		} else
++#endif
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,

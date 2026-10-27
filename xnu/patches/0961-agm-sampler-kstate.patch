@@ -1,0 +1,51 @@
+agm-0961: on SWEET_AGM the process sampler prints where each thread waits in the
+kernel (state, wait event, block hint, kernel-stack backtrace) and no longer reads
+user memory while holding the task lock (it hung itself on a stalled launchd).
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764be..08acf908c 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1018,6 +1018,34 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		int n;
+ 		uint64_t fp;
+ 
++#if defined(SWEET_AGM)
++		(void)fp;
++		(void)map;
++		n = snprintf(line, sizeof(line), "SMP %s t%d", name, tn++);
++		if (ss != NULL && is_saved_state64(ss)) {
++			n += snprintf(line + n, sizeof(line) - n, " pc 0x%llx lr 0x%llx sp 0x%llx",
++			    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		}
++		n += snprintf(line + n, sizeof(line) - n, " state 0x%x wait 0x%llx hint %d",
++		    thread->state, (uint64_t)thread->wait_event, (int)thread->block_hint);
++		if (thread != current_thread() && thread->kernel_stack != 0 && thread->machine.kstackptr != 0) {
++			/* kstackptr -> struct thread_kernel_state, whose first member's first member is the saved ss (pcb.c) */
++			const arm_kernel_saved_state_t *ks = (const arm_kernel_saved_state_t *)thread->machine.kstackptr;
++			const vm_offset_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
++			uint64_t kfp = ks->fp;
++			n += snprintf(line + n, sizeof(line) - n, " klr 0x%llx kbt", ks->lr);
++			for (int i = 0; i < 16 && kfp >= lo && kfp + 16 <= hi && (kfp & 7) == 0 &&
++			    n < (int)sizeof(line) - 20; i++) {
++				const uint64_t *f = (const uint64_t *)kfp;
++				n += snprintf(line + n, sizeof(line) - n, " 0x%llx", f[1]);
++				if (f[0] <= kfp) {
++					break;
++				}
++				kfp = f[0];
++			}
++		}
++		printf("%s\n", line);
++#else
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+@@ -1036,6 +1064,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			fp = frame[0];
+ 		}
+ 		printf("%s\n", line);
++#endif
+ 	}
+ 	task_unlock(task);
+ }

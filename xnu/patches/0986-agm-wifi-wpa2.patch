@@ -1,0 +1,754 @@
+From 5a4487c3aa8d4b238f0a653268aec6433e9683ea Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 12:44:36 +0300
+Subject: [PATCH] agm 0986 wifi WPA2: the 4-way handshake in the kernel (EAPOL
+ over channel 9 / WIFI_CMD_TX_DATA, keys by WIFI_CMD_KEY)
+
+---
+ bsd/dev/agm_wifi.c | 615 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 601 insertions(+), 14 deletions(-)
+
+diff --git a/bsd/dev/agm_wifi.c b/bsd/dev/agm_wifi.c
+index ac6075b9b..bd236ef5d 100644
+--- a/bsd/dev/agm_wifi.c
++++ b/bsd/dev/agm_wifi.c
+@@ -12,7 +12,12 @@
+  * Scan: SCAN {le32 bits of channels 1-13, le32 0, le16 ssid_len 0, le16 n_5g, le16 5 GHz channels}; the
+  * firmware answers with WIFI_EVENT_MGMT_FRAME (0x83: {u8 type, channel; s8 signal; u8 rsv; bssid[6];
+  * le16 len; the beacon or probe response}) and WIFI_EVENT_SCAN_DONE (0x82).
+- * Joining and the data path are not there yet.
++ * Join: SET_IE (our RSN element for the association request), CONNECT, then for WPA2-PSK the 4-way handshake
++ * here, as wpa_supplicant does it on Android (the firmware does not do it, a PMK in CONNECT or not): the AP's
++ * EAPOL frames come up on data channel 9 as "special data" (an rx_msdu_desc, type 3, the frame as Ethernet at
++ * its msdu_offset), ours go down as WIFI_CMD_TX_DATA {5 bytes address, tx_msdu_dscr, the Ethernet frame}, the
++ * keys by WIFI_CMD_KEY ADD (pairwise index 0 with the AP's address, then the group key).
++ * The data path is not there yet.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
+ #include <sys/param.h>
+@@ -22,6 +27,8 @@
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <sys/random.h>
++#include <kern/thread.h>
+ #include <sys/redwood_net.h>
+ #include <sys/redwood_sta.h>
+ 
+@@ -45,6 +52,8 @@ void agm_wifi_bring_up(void);
+ #define WIFI_CMD_DISCONNECT     13
+ #define WIFI_CMD_KEY            14
+ #define WIFI_CMD_SET_IE         25
++#define WIFI_CMD_TX_DATA        72
++#define SUBCMD_ADD              3
+ #define IE_ASSOC_REQ            3
+ 
+ /* sc2355 cipher/akm (cmdevt.h); OR SPRDWL_VALID_CONFIG into a field that is being set */
+@@ -67,6 +76,8 @@ static volatile int8_t connect_result;          /* 0 pending-ok, 1 associated, -
+ static struct redwood_sta_bss joined_bss;
+ static int join_last_error;
+ static uint8_t sta_lut = 0xff;                   /* the firmware's LUT index for this peer (data path) */
++enum { HS_OFF, HS_WAIT, HS_DONE, HS_FAILED };
++static volatile int hs_state;                   /* the WPA2 4-way handshake of the join */
+ 
+ /* ---- what the scans hear ---- */
+ #define BSS_MOST        48
+@@ -184,13 +195,25 @@ event_disconnect(const uint8_t *d, uint32_t len)
+ {
+ 	uint16_t reason = len >= 2 ? (uint16_t)(d[0] | d[1] << 8) : 0;
+ 
+-	printf("AGM WIFI: disconnect, reason %u (state %d)\n", reason, sta_cstate);
+-	if (sta_cstate == ST_CONNECTED) {
++	printf("AGM WIFI: disconnect, reason %u (state %d, handshake %d)\n", reason, sta_cstate, hs_state);
++	if (sta_cstate == ST_CONNECTING) {
++		if (connect_result == 0) {
++			join_last_error = ECONNREFUSED;
++			connect_result = -1;
++		}
++		if (hs_state == HS_WAIT) {
++			join_last_error = EAUTH;        /* the AP gave up on the 4-way handshake */
++			hs_state = HS_FAILED;
++		}
++	} else if (sta_cstate == ST_CONNECTED) {
+ 		redwood_net_link_state(false);
+ 		redwood_sta_lost(ECONNRESET);
+ 	}
+ 	sta_cstate = ST_IDLE;
+ 	sta_lut = 0xff;
++	if (hs_state != HS_FAILED) {
++		hs_state = HS_OFF;              /* (no lock here: the handshake thread may be in a command) */
++	}
+ }
+ 
+ static void
+@@ -322,6 +345,509 @@ w_pbkdf2_pmk(const uint8_t *pass, size_t plen, const uint8_t *ssid, size_t slen,
+ 	}
+ }
+ 
++/* IEEE 802.11 PRF-SHA1 */
++static void
++w_prf(const uint8_t *key, size_t klen, const char *label, const uint8_t *data, size_t dlen, uint8_t *out, size_t olen)
++{
++	uint8_t buf[128], h[20];
++	size_t ll = strlen(label);
++
++	for (uint8_t i = 0; olen > 0; i++) {
++		memcpy(buf, label, ll);
++		buf[ll] = 0;
++		memcpy(buf + ll + 1, data, dlen);
++		buf[ll + 1 + dlen] = i;
++		w_hmac_sha1(key, klen, buf, ll + 2 + dlen, NULL, 0, h);
++		size_t take = MIN(olen, (size_t)20);
++		memcpy(out, h, take);
++		out += take;
++		olen -= take;
++	}
++}
++
++/* AES-128 decryption of one block (FIPS-197) and the RFC 3394 key unwrap, for the group key (topaz 0129) */
++static const uint8_t aes_sbox[256] = {
++	0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
++	0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
++	0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
++	0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
++	0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
++	0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
++	0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
++	0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
++};
++
++static uint8_t aes_xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
++static uint8_t aes_mul(uint8_t a, uint8_t b) { uint8_t r = 0; while (b) { if (b & 1) { r ^= a; } a = aes_xt(a); b >>= 1; } return r; }
++
++static void
++aes128_expand(const uint8_t key[16], uint8_t rk[176])
++{
++	uint8_t rcon = 1;
++
++	memcpy(rk, key, 16);
++	for (int i = 16; i < 176; i += 4) {
++		uint8_t t[4];
++		memcpy(t, rk + i - 4, 4);
++		if (i % 16 == 0) {
++			uint8_t x = t[0];
++			t[0] = aes_sbox[t[1]] ^ rcon; t[1] = aes_sbox[t[2]]; t[2] = aes_sbox[t[3]]; t[3] = aes_sbox[x];
++			rcon = aes_xt(rcon);
++		}
++		for (int j = 0; j < 4; j++) {
++			rk[i + j] = rk[i - 16 + j] ^ t[j];
++		}
++	}
++}
++
++static void
++aes128_decrypt(const uint8_t rk[176], uint8_t s[16])
++{
++	uint8_t inv[256];
++
++	for (int i = 0; i < 256; i++) {
++		inv[aes_sbox[i]] = (uint8_t)i;
++	}
++	for (int j = 0; j < 16; j++) {
++		s[j] ^= rk[160 + j];
++	}
++	for (int r = 9; r >= 0; r--) {
++		uint8_t t[16];
++		for (int c = 0; c < 4; c++) {           /* inverse shift rows + inverse sub bytes */
++			for (int row = 0; row < 4; row++) {
++				t[4 * ((c + row) % 4) + row] = inv[s[4 * c + row]];
++			}
++		}
++		for (int j = 0; j < 16; j++) {
++			t[j] ^= rk[16 * r + j];
++		}
++		if (r == 0) {
++			memcpy(s, t, 16);
++			break;
++		}
++		for (int c = 0; c < 4; c++) {           /* inverse mix columns */
++			uint8_t *q = t + 4 * c, a0 = q[0], a1 = q[1], a2 = q[2], a3 = q[3];
++			s[4 * c] = aes_mul(a0, 14) ^ aes_mul(a1, 11) ^ aes_mul(a2, 13) ^ aes_mul(a3, 9);
++			s[4 * c + 1] = aes_mul(a0, 9) ^ aes_mul(a1, 14) ^ aes_mul(a2, 11) ^ aes_mul(a3, 13);
++			s[4 * c + 2] = aes_mul(a0, 13) ^ aes_mul(a1, 9) ^ aes_mul(a2, 14) ^ aes_mul(a3, 11);
++			s[4 * c + 3] = aes_mul(a0, 11) ^ aes_mul(a1, 13) ^ aes_mul(a2, 9) ^ aes_mul(a3, 14);
++		}
++	}
++}
++
++/* RFC 3394 key unwrap with a 128-bit KEK; out gets len-8 bytes. False if the check value is wrong. */
++static bool
++aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t len, uint8_t *out)
++{
++	uint8_t rk[176], a[8], b[16];
++	size_t n = len / 8 - 1;
++
++	if (len < 24 || len % 8 != 0) {
++		return false;
++	}
++	aes128_expand(kek, rk);
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, len - 8);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			memcpy(b, a, 8);
++			for (int k = 0; k < 8; k++) {
++				b[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			aes128_decrypt(rk, b);
++			memcpy(a, b, 8);
++			memcpy(out + 8 * (i - 1), b + 8, 8);
++		}
++	}
++	for (int k = 0; k < 8; k++) {
++		if (a[k] != 0xA6) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++w_crypto_selftest(void)
++{
++	static const uint8_t kek[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
++	static const uint8_t ct[24] = { 0x1F,0xA6,0x8B,0x0A,0x81,0x12,0xB4,0x47,0xAE,0xF3,0x4B,0xD8,0xFB,0x5A,0x7B,0x82,
++		                        0x9D,0x3E,0x86,0x23,0x71,0xD2,0xCF,0xE5 };
++	static const uint8_t pt[16] = { 0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF };
++	static const uint8_t pmk_ref[4] = { 0xf4, 0x2c, 0x6f, 0xc5 };     /* "password"/"IEEE" (802.11 annex) */
++	uint8_t out[16], pmk[32];
++	bool a = aes_unwrap(kek, ct, 24, out) && memcmp(out, pt, 16) == 0;
++
++	w_pbkdf2_pmk((const uint8_t *)"password", 8, (const uint8_t *)"IEEE", 4, pmk);
++	printf("AGM WPA: crypto self-test: key unwrap %s, pbkdf2 %s\n", a ? "ok" : "FAILED",
++	    memcmp(pmk, pmk_ref, 4) == 0 ? "ok" : "FAILED");
++}
++
++/* ---- the WPA2-PSK 4-way handshake (EAPOL-Key, descriptor version 2: HMAC-SHA1-128 MIC, AES key wrap) ---- */
++static LCK_MTX_DECLARE(hs_lock, &wifi_lck_grp);         /* the handshake's state, the thread's own */
++static uint8_t hs_pmk[32], hs_ptk[48], hs_anonce[32], hs_snonce[32], hs_bssid[6], hs_rsn_ie[22], hs_group;
++static uint64_t hs_replay;
++static unsigned hs_msg1s;
++static bool hs_have_ptk;
++
++/* EAPOL frames from the SIPC thread to the handshake thread */
++#define EQ_MOST                 8
++#define EQ_FRAME_MOST           600
++static struct { uint16_t len; uint8_t f[EQ_FRAME_MOST]; } eq[EQ_MOST];
++static unsigned eq_head, eq_tail;
++static LCK_MTX_DECLARE(eq_lock, &wifi_lck_grp);
++
++static void
++w_hexdump(const char *what, const uint8_t *p, uint32_t len)
++{
++	char s[3 * 32 + 1];
++
++	for (uint32_t o = 0; o < len && o < 256; o += 32) {
++		unsigned k = 0;
++		for (uint32_t i = o; i < len && i < o + 32; i++) {
++			k += (unsigned)snprintf(s + k, sizeof(s) - k, "%02x ", p[i]);
++		}
++		printf("AGM WPA %s +%02x: %s\n", what, o, s);
++	}
++}
++
++static void
++hs_end(int state, int error)
++{
++	join_last_error = error;
++	hs_state = state;
++}
++
++/* one Ethernet frame to the AP through the command channel (as the vendor's sprdwl_xmit_data2cmd_wq):
++ * {5 bytes: address | bit 39, unused here; tx_msdu_dscr: common (type 0 cmd, interface = ctx), offset 11,
++ * tx_ctrl 0, le16 pkt_len, buffer_info 0, sta_lut_index, color/seq 0, tcp_udp_header_offset 0; the frame} */
++static int
++w_tx_ether(const uint8_t *e, uint32_t len)
++{
++	uint8_t p[16 + 14 + 4 + 95 + 64];
++
++	if (len > sizeof(p) - 16) {
++		return EINVAL;
++	}
++	bzero(p, 16);
++	p[4] = 0x80;
++	p[5] = (uint8_t)((sta_ctx & 7) << 5);
++	p[6] = 11;
++	p[8] = (uint8_t)len;
++	p[9] = (uint8_t)(len >> 8);
++	p[11] = sta_lut != 0xff ? sta_lut : 6;  /* 0-5 are the firmware's own */
++	memcpy(p + 16, e, len);
++	int r = agm_sipc_cmd(WIFI_CMD_TX_DATA, sta_ctx, p, 16 + len, 1000, NULL, NULL);
++	return r == 0 ? 0 : EIO;
++}
++
++static int
++w_add_key(bool pairwise, uint8_t index, const uint8_t *mac, const uint8_t *seq8, uint8_t cipher, const uint8_t *key,
++    uint8_t klen)
++{
++	uint8_t p[1 + 26 + 32];
++
++	bzero(p, sizeof(p));
++	p[0] = SUBCMD_ADD;
++	p[1] = index;
++	p[2] = pairwise;
++	if (mac != NULL) {
++		memcpy(p + 3, mac, 6);
++	}
++	if (seq8 != NULL) {
++		memcpy(p + 9, seq8, 8);
++	}
++	p[25] = cipher;
++	p[26] = klen;
++	memcpy(p + 27, key, klen);
++	int r = agm_sipc_cmd(WIFI_CMD_KEY, sta_ctx, p, 27u + klen, 2000, NULL, NULL);
++	bzero(p, sizeof(p));
++	return r;
++}
++
++static void
++w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t dlen)
++{
++	uint8_t e[14 + 4 + 95 + 64], *k = e + 18, mic[20];
++	uint16_t body = (uint16_t)(95 + dlen);
++
++	bzero(e, sizeof(e));
++	memcpy(e, hs_bssid, 6);
++	memcpy(e + 6, wifi_mac, 6);
++	e[12] = 0x88;
++	e[13] = 0x8e;
++	e[14] = 1;                                  /* EAPOL version */
++	e[15] = 3;                                  /* key */
++	e[16] = (uint8_t)(body >> 8);
++	e[17] = (uint8_t)body;
++	k[0] = 2;                                   /* RSN key descriptor */
++	k[1] = (uint8_t)(info >> 8);
++	k[2] = (uint8_t)info;
++	for (int i = 0; i < 8; i++) {
++		k[5 + i] = (uint8_t)(hs_replay >> (56 - 8 * i));
++	}
++	if (nonce != NULL) {
++		memcpy(k + 13, nonce, 32);
++	}
++	k[93] = (uint8_t)(dlen >> 8);
++	k[94] = (uint8_t)dlen;
++	if (dlen) {
++		memcpy(k + 95, data, dlen);
++	}
++	w_hmac_sha1(hs_ptk, 16, e + 14, 4u + body, NULL, 0, mic);
++	memcpy(k + 77, mic, 16);
++	int r = w_tx_ether(e, 18u + body);
++	if (r != 0) {
++		printf("AGM WPA: EAPOL-Key %#x not sent (%d)\n", info, r);
++	}
++}
++
++static bool
++w_eapol_mic_ok(uint8_t *eapol, size_t len)
++{
++	uint8_t want[16], got[20];
++
++	if (len < 4 + 95) {
++		return false;
++	}
++	memcpy(want, eapol + 4 + 77, 16);
++	bzero(eapol + 4 + 77, 16);
++	w_hmac_sha1(hs_ptk, 16, eapol, len, NULL, 0, got);
++	memcpy(eapol + 4 + 77, want, 16);
++	return memcmp(want, got, 16) == 0;
++}
++
++/* the GTK KDE {dd, len, 00-0f-ac 01, keyid/tx, rsvd, key} out of the unwrapped key data; its length or 0 */
++static uint8_t
++w_find_gtk(const uint8_t *plain, uint32_t n, uint8_t gtk[32], uint8_t *index)
++{
++	for (uint32_t o = 0; o + 2 <= n && o + 2 + plain[o + 1] <= n; o += 2u + plain[o + 1]) {
++		if (plain[o] == 0xdd && plain[o + 1] >= 6 + 16 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0f &&
++		    plain[o + 4] == 0xac && plain[o + 5] == 0x01) {
++			uint8_t l = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
++			*index = plain[o + 6] & 3;
++			memcpy(gtk, plain + o + 8, l);
++			return l;
++		}
++		if (plain[o] == 0xdd && plain[o + 1] == 0) {
++			break;                          /* padding */
++		}
++	}
++	return 0;
++}
++
++static int
++w_install_gtk(uint8_t index, const uint8_t *rsc, const uint8_t *gtk, uint8_t len)
++{
++	uint8_t key[32];
++
++	memcpy(key, gtk, len);
++	if (hs_group == CIPHER_TKIP && len == 32) {     /* Michael: swap the Tx and Rx keys, as wpa_supplicant */
++		memcpy(key + 16, gtk + 24, 8);
++		memcpy(key + 24, gtk + 16, 8);
++	}
++	int r = w_add_key(false, index, NULL, rsc, hs_group, key, len);
++	bzero(key, sizeof(key));
++	return r;
++}
++
++static void
++w_eapol_rx(const uint8_t *e, uint32_t elen)
++{
++	static uint8_t frame[EQ_FRAME_MOST];
++	static unsigned dumped;
++
++	if (dumped < 6) {
++		dumped++;
++		w_hexdump("rx", e, elen);
++	}
++	if (hs_state != HS_WAIT && hs_state != HS_DONE) {
++		printf("AGM WPA: EAPOL frame of %u bytes with no handshake under way\n", elen);
++		return;
++	}
++	if (elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) || memcmp(e + 6, hs_bssid, 6) != 0) {
++		printf("AGM WPA: EAPOL frame of %u bytes ignored (short, or not from the AP)\n", elen);
++		return;
++	}
++	uint32_t len = elen - 14;
++	memcpy(frame, e + 14, len);
++	uint8_t *k = frame + 4;
++	if (frame[1] != 3 || (k[0] != 2 && k[0] != 254)) {
++		printf("AGM WPA: EAPOL type %u descriptor %u ignored\n", frame[1], k[0]);
++		return;
++	}
++	uint16_t info = (uint16_t)(k[1] << 8 | k[2]), dlen = (uint16_t)(k[93] << 8 | k[94]);
++	uint64_t replay = 0;
++	for (int i = 0; i < 8; i++) {
++		replay = replay << 8 | k[5 + i];
++	}
++	if (95u + dlen > len - 4) {
++		printf("AGM WPA: EAPOL-Key data length %u past the frame (%u)\n", dlen, len);
++		return;
++	}
++	bool pairwise = info & 0x0008, ack = info & 0x0080, has_mic = info & 0x0100, install = info & 0x0040;
++	bool encrypted = info & 0x1000;
++	printf("AGM WPA: rx EAPOL-Key info %#06x replay %llu data %u\n", info, (unsigned long long)replay, dlen);
++	if ((info & 7) != 2) {
++		printf("AGM WPA: key descriptor version %u not supported (only 2: HMAC-SHA1, AES)\n", info & 7);
++		hs_end(HS_FAILED, EPROTONOSUPPORT);
++		return;
++	}
++
++	if (pairwise && ack && !has_mic) {
++		/* message 1: ANonce -> PTK, answer with message 2 (our RSN element as in the association request) */
++		if (++hs_msg1s > 4) {
++			printf("AGM WPA: the AP keeps sending message 1: wrong passphrase (or message 2 does not reach it)\n");
++			hs_end(HS_FAILED, EAUTH);
++			return;
++		}
++		hs_replay = replay;
++		memcpy(hs_anonce, k + 13, 32);
++		read_random(hs_snonce, 32);
++		uint8_t data[76];
++		const uint8_t *aa = hs_bssid, *spa = wifi_mac;
++		bool amin = memcmp(aa, spa, 6) < 0, nmin = memcmp(hs_anonce, hs_snonce, 32) < 0;
++		memcpy(data, amin ? aa : spa, 6);
++		memcpy(data + 6, amin ? spa : aa, 6);
++		memcpy(data + 12, nmin ? hs_anonce : hs_snonce, 32);
++		memcpy(data + 44, nmin ? hs_snonce : hs_anonce, 32);
++		w_prf(hs_pmk, 32, "Pairwise key expansion", data, sizeof(data), hs_ptk, 48);
++		hs_have_ptk = true;
++		w_eapol_send(0x010a, hs_snonce, hs_rsn_ie, sizeof(hs_rsn_ie));
++		printf("AGM WPA: message 1 (#%u) -> message 2 sent\n", hs_msg1s);
++		return;
++	}
++	if (pairwise && ack && has_mic && install) {
++		/* message 3: check, unwrap the GTK, answer with message 4, then the keys */
++		if (!hs_have_ptk || memcmp(k + 13, hs_anonce, 32) != 0) {
++			printf("AGM WPA: message 3 without (or with another) message 1: ignored\n");
++			return;
++		}
++		if (!w_eapol_mic_ok(frame, len)) {
++			printf("AGM WPA: message 3 MIC wrong: wrong passphrase\n");
++			hs_end(HS_FAILED, EAUTH);
++			return;
++		}
++		if (replay < hs_replay) {
++			printf("AGM WPA: message 3 replayed: ignored\n");
++			return;
++		}
++		hs_replay = replay;
++		uint8_t plain[256], gtk[32], gtk_len = 0, gtk_idx = 1;
++		if (encrypted && dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(hs_ptk + 16, k + 95, dlen, plain)) {
++			gtk_len = w_find_gtk(plain, dlen - 8u, gtk, &gtk_idx);
++		} else if (encrypted) {
++			printf("AGM WPA: message 3 key data does not unwrap (%u bytes)\n", dlen);
++		}
++		bzero(plain, sizeof(plain));
++		w_eapol_send(0x030a, NULL, NULL, 0);
++		printf("AGM WPA: message 3 -> message 4 sent\n");
++		IOSleep(10);                            /* message 4 out in the clear before the keys go in */
++		int rp = w_add_key(true, 0, hs_bssid, NULL, CIPHER_CCMP, hs_ptk + 32, 16);
++		int rg = gtk_len ? w_install_gtk(gtk_idx, k + 61, gtk, gtk_len) : -1;
++		bzero(gtk, sizeof(gtk));
++		printf("AGM WPA: *** WPA2 keys installed: pairwise %d, group %d (index %u, %u bytes) ***\n", rp, rg, gtk_idx,
++		    gtk_len);
++		hs_end(rp == 0 ? HS_DONE : HS_FAILED, rp == 0 ? 0 : EIO);
++		return;
++	}
++	if (!pairwise && ack && has_mic && hs_state == HS_DONE) {
++		/* the group key handshake (a new GTK): message 1 -> message 2 */
++		if (!w_eapol_mic_ok(frame, len) || replay <= hs_replay) {
++			printf("AGM WPA: group message 1 MIC wrong or replayed: ignored\n");
++			return;
++		}
++		hs_replay = replay;
++		uint8_t plain[256], gtk[32], gtk_len = 0, gtk_idx = 1;
++		if (encrypted && dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(hs_ptk + 16, k + 95, dlen, plain)) {
++			gtk_len = w_find_gtk(plain, dlen - 8u, gtk, &gtk_idx);
++		}
++		bzero(plain, sizeof(plain));
++		w_eapol_send(0x0302, NULL, NULL, 0);
++		int rg = gtk_len ? w_install_gtk(gtk_idx, k + 61, gtk, gtk_len) : -1;
++		bzero(gtk, sizeof(gtk));
++		printf("AGM WPA: group key renewed: %d (index %u)\n", rg, gtk_idx);
++		return;
++	}
++	printf("AGM WPA: EAPOL-Key info %#06x not expected here: ignored\n", info);
++}
++
++/* the handshake thread: what the SIPC thread queued, one frame at a time (commands wait for answers here) */
++static void
++hs_thread(__unused void *param, __unused wait_result_t wr)
++{
++	static uint8_t f[EQ_FRAME_MOST];
++
++	for (;;) {
++		uint16_t len = 0;
++		lck_mtx_lock(&eq_lock);
++		if (eq_tail != eq_head) {
++			len = eq[eq_tail % EQ_MOST].len;
++			memcpy(f, eq[eq_tail % EQ_MOST].f, len);
++			eq_tail++;
++		}
++		lck_mtx_unlock(&eq_lock);
++		if (len == 0) {
++			IOSleep(5);
++			continue;
++		}
++		lck_mtx_lock(&hs_lock);
++		w_eapol_rx(f, len);
++		lck_mtx_unlock(&hs_lock);
++	}
++}
++
++static void
++eapol_queue(const uint8_t *e, uint32_t len)
++{
++	if (len > EQ_FRAME_MOST) {
++		printf("AGM WPA: EAPOL frame of %u bytes too long\n", len);
++		return;
++	}
++	lck_mtx_lock(&eq_lock);
++	if (eq_head - eq_tail < EQ_MOST) {
++		eq[eq_head % EQ_MOST].len = (uint16_t)len;
++		memcpy(eq[eq_head % EQ_MOST].f, e, len);
++		eq_head++;
++	} else {
++		printf("AGM WPA: EAPOL queue full, frame dropped\n");
++	}
++	lck_mtx_unlock(&eq_lock);
++}
++
++/* before CONNECT: the handshake to come */
++static void
++hs_prepare(const uint8_t bssid[6], const uint8_t pmk[32], const uint8_t rsn_ie[22], uint8_t group)
++{
++	lck_mtx_lock(&eq_lock);
++	eq_tail = eq_head;                      /* what is left of an earlier join */
++	lck_mtx_unlock(&eq_lock);
++	lck_mtx_lock(&hs_lock);
++	memcpy(hs_bssid, bssid, 6);
++	memcpy(hs_pmk, pmk, 32);
++	memcpy(hs_rsn_ie, rsn_ie, 22);
++	hs_group = group;
++	hs_replay = 0;
++	hs_msg1s = 0;
++	hs_have_ptk = false;
++	bzero(hs_ptk, sizeof(hs_ptk));
++	hs_state = HS_WAIT;
++	lck_mtx_unlock(&hs_lock);
++}
++
++static void
++hs_forget(void)
++{
++	lck_mtx_lock(&hs_lock);
++	hs_state = HS_OFF;
++	hs_have_ptk = false;
++	bzero(hs_pmk, sizeof(hs_pmk));
++	bzero(hs_ptk, sizeof(hs_ptk));
++	lck_mtx_unlock(&hs_lock);
++}
++
+ /* ---- the station side of sys/redwood_sta.h ---- */
+ static const uint8_t g5_channels[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+ 	                               132, 136, 140, 149, 153, 157, 161, 165 };
+@@ -462,11 +988,9 @@ sta_join(const struct redwood_sta_join *what)
+ 	con[13] = secured ? (grp | VALID_CONFIG) : 0;
+ 	con[14] = secured ? (AKM_PSK | VALID_CONFIG) : 0;
+ 	con[15] = 0;                            /* mfp off */
+-	con[16] = secured ? 32 : 0;             /* psk_len: the PMK, for the firmware to run the 4-way itself */
++	con[16] = 0;                            /* psk_len 0, as on Android: the 4-way is ours (the firmware does not
++	                                         * run it even when given the PMK) */
+ 	con[17] = what->ssid_length;
+-	if (secured) {
+-		memcpy(con + 18, pmk, 32);
+-	}
+ 	memcpy(con + 50, what->ssid, what->ssid_length);
+ 
+ 	printf("AGM WIFI: join \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x chan %u %s\n", what->ssid_length,
+@@ -475,31 +999,39 @@ sta_join(const struct redwood_sta_join *what)
+ 
+ 	/* the association request carries our RSN element (WPA2-PSK, CCMP; the AP's group cipher), as the
+ 	 * supplicant sets it on Android (SET_IE, assoc request): without it a WPA2 AP refuses (status 1) */
++	uint8_t rsn[22] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4,
++		            1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
++	rsn[7] = grp;
+ 	{
+ 		uint8_t ie[3 + 22];
+ 		uint16_t l = secured ? 22 : 0;
+ 		ie[0] = IE_ASSOC_REQ;
+ 		memcpy(ie + 1, &l, 2);
+ 		if (secured) {
+-			static const uint8_t rsn[22] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4,
+-				                         1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
+ 			memcpy(ie + 3, rsn, 22);
+-			ie[3 + 7] = grp;
+ 		}
+ 		if (agm_sipc_cmd(WIFI_CMD_SET_IE, sta_ctx, ie, 3u + l, 2000, NULL, NULL) < 0) {
+ 			printf("AGM WIFI: join: SET_IE refused\n");
+ 		}
+ 	}
++	/* message 2 carries the same RSN element */
++	if (secured) {
++		hs_prepare(best.bssid, pmk, rsn, grp);
++	} else {
++		hs_forget();
++	}
+ 
+ 	bzero(&joined_bss, sizeof(joined_bss));
+ 	joined_bss = best;
+ 	connect_result = 0;
++	join_last_error = 0;
+ 	sta_cstate = ST_CONNECTING;
+ 	int r = agm_sipc_cmd(WIFI_CMD_CONNECT, sta_ctx, con, sizeof(con), 3000, NULL, NULL);
+ 	bzero(pmk, sizeof(pmk));
+ 	bzero(con, sizeof(con));
+ 	if (r < 0) {
+ 		sta_cstate = ST_IDLE;
++		hs_forget();
+ 		return EIO;
+ 	}
+ 	for (unsigned t = 0; t < 10000 && connect_result == 0; t += 10) {
+@@ -507,11 +1039,31 @@ sta_join(const struct redwood_sta_join *what)
+ 	}
+ 	if (connect_result != 1) {
+ 		sta_cstate = ST_IDLE;
++		hs_forget();
+ 		return join_last_error ? join_last_error : ETIMEDOUT;
+ 	}
++	if (secured) {
++		/* the 4-way handshake on the handshake thread: the AP starts it right after the association */
++		for (unsigned t = 0; t < 12000 && hs_state == HS_WAIT && sta_cstate == ST_CONNECTING; t += 10) {
++			IOSleep(10);
++		}
++		if (hs_state != HS_DONE) {
++			int e = hs_state == HS_FAILED && join_last_error ? join_last_error : ETIMEDOUT;
++			printf("AGM WIFI: join: WPA2 handshake failed (%d, state %d)\n", e, hs_state);
++			if (sta_cstate == ST_CONNECTING) {
++				uint16_t reason = 15;   /* 4-way handshake timeout */
++				(void)agm_sipc_cmd(WIFI_CMD_DISCONNECT, sta_ctx, &reason, 2, 2000, NULL, NULL);
++			}
++			sta_cstate = ST_IDLE;
++			sta_lut = 0xff;
++			hs_forget();
++			join_last_error = e;
++			return e;
++		}
++	}
+ 	sta_cstate = ST_CONNECTED;
+-	/* the data path is not up yet, so the link stays down (no DHCP): association only, for now */
+-	printf("AGM WIFI: join done; data path still to come\n");
++	/* the data path is not up yet, so the link stays down (no DHCP): association and keys only, for now */
++	printf("AGM WIFI: join done%s; data path still to come\n", secured ? " (WPA2 keys in)" : "");
+ 	return 0;
+ }
+ 
+@@ -526,6 +1078,7 @@ sta_leave(void)
+ 		sta_lut = 0xff;
+ 		redwood_net_link_state(false);
+ 	}
++	hs_forget();
+ 	return 0;
+ }
+ 
+@@ -623,8 +1176,12 @@ mac_from_boot_arg(void)
+ 	}
+ }
+ 
+-/* from the SIPC thread: a block the firmware put on a data channel (8 or 9). For now, logged so the
+- * real RX descriptor/address-buffer format can be read before the data path is written. */
++/*
++ * From the SIPC thread: a block the firmware put on a data channel (8 or 9). "Special data" (the first word an
++ * rx_msdu_desc: host_type:4 = 3, ctx_id:4, msdu_offset:8, msdu_len:16; 28 bytes of it, then the 802.11 header)
++ * carries the frame itself at msdu_offset, as Ethernet: EAPOL goes to the handshake thread. The rest is
++ * logged, so the data path's formats can be read before it is written.
++ */
+ void agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len);
+ void
+ agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len)
+@@ -632,6 +1189,28 @@ agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len)
+ 	static unsigned seen[2];
+ 	int k = channel == 9 ? 1 : 0;
+ 
++	if (len >= 28 && (msg[0] & 0xf) == 3) {
++		uint32_t off = msg[1], mlen = (uint32_t)msg[2] | (uint32_t)msg[3] << 8;
++		if (off >= 28 && off + mlen <= len && mlen >= 14) {
++			const uint8_t *e = msg + off;
++			static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
++			if (e[12] == 0x88 && e[13] == 0x8e) {
++				eapol_queue(e, mlen);
++				return;
++			}
++			if (memcmp(e, snap, 8) == 0 && mlen > 8 && mlen - 8 + 14 <= EQ_FRAME_MOST) {
++				/* not converted: LLC/SNAP right after the 802.11 header (addr1 at +4, addr3 at +16) */
++				uint8_t f[EQ_FRAME_MOST];
++				memcpy(f, msg + 28 + 4, 6);
++				memcpy(f + 6, (msg[28 + 1] & 2) ? msg + 28 + 16 : msg + 28 + 10, 6);
++				f[12] = 0x88;
++				f[13] = 0x8e;
++				memcpy(f + 14, e + 8, mlen - 8);
++				eapol_queue(f, mlen - 8 + 14);
++				return;
++			}
++		}
++	}
+ 	if (seen[k]++ < 12) {
+ 		char line[3 * 48 + 1];
+ 		unsigned n = 0;
+@@ -713,6 +1292,14 @@ agm_wifi_bring_up(void)
+ 	sta_ctx = rlen >= 1 ? buf[0] : 0;
+ 	printf("AGM WIFI: station open, ctx %u\n", sta_ctx);
+ 
++	w_crypto_selftest();
++	thread_t th;
++	if (kernel_thread_start(hs_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("AGM WPA: no handshake thread\n");
++	}
++
+ 	memcpy(net_link.address, wifi_mac, 6);
+ 	memcpy(sta_ops.address, wifi_mac, 6);
+ 	if (redwood_net_attach(&net_link)) {
+-- 
+2.39.5 (Apple Git-154)
+

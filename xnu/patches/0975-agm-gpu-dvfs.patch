@@ -1,0 +1,55 @@
+agm-0975: AGM H6 Mali clock through the GPU DVFS hardware (GPU DVFS APB 0x23014000, after the
+vendor qogirl6 platform code): index 2 (614.4 MHz, 0.75 V by the hardware's defaults) instead
+of u-boot's 0 (384 MHz); boot-arg agm_gpu_dvfs=N (0-3). The index maps and state are logged.
+
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+index 10814882c..c5fbf159a 100644
+--- a/iokit/Kernel/arm/AgmMali.cpp
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -507,6 +507,38 @@ agm_mali_va_free(uint64_t address, uint64_t size)
+ 
+ /* ---------------------------------------------------------------- power, reset */
+ 
++/*
++ * The clock through the GPU DVFS hardware (GPU DVFS APB 0x23014000, the vendor qogirl6
++ * platform code): FREQ_UPD_TYPE_CFG (+0xa4) bit 0 = handshake, then DVFS_INDEX_CFG (+0x8c) =
++ * the index; the hardware switches clock and voltage together (CORE_INDEXn_MAP, +0x48 + 4n,
++ * bits 16:14 the voltage gear: 0.70, 0.75, 0.80 V). T606 indices: 0 384 MHz, 1 512, 2 614.4
++ * (0.75 V by default), 4 GPLL (650 MHz once set up). Boot-arg agm_gpu_dvfs=N, default 2;
++ * u-boot leaves 0.
++ */
++static void
++dvfs(void)
++{
++	volatile uint32_t *d = (volatile uint32_t *)ml_io_map(GPU_APB_PA + 0x14000, 0x1000);
++	uint32_t index = 2;
++
++	(void)PE_parse_boot_argn("agm_gpu_dvfs", &index, sizeof(index));
++	if (d == NULL) {
++		return;
++	}
++	IOLog("AGM MALI: DVFS index %u state %#x upd %#x maps %#x %#x %#x %#x %#x, core clock %#x\n", d[0x8c / 4] & 7,
++	    d[0x98 / 4], d[0xa4 / 4], d[0x48 / 4], d[0x4c / 4], d[0x50 / 4], d[0x54 / 4], d[0x58 / 4],
++	    *(volatile uint32_t *)(gapb + 0x4));
++	if (index > 3) {
++		return;                 /* (4 and up need the GPLL set up first) */
++	}
++	d[0xa4 / 4] |= 1u;
++	d[0x8c / 4] = (d[0x8c / 4] & ~7u) | index;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IODelay(1000);
++	IOLog("AGM MALI: DVFS index now %u, state %#x, core clock %#x\n", d[0x8c / 4] & 7, d[0x98 / 4],
++	    *(volatile uint32_t *)(gapb + 0x4));
++}
++
+ static bool
+ power_up(void)
+ {
+@@ -543,6 +575,7 @@ power_up(void)
+ 	IODelay(200);
+ 	*(volatile uint32_t *)gapb &= ~3u;                                     /* soft resets released */
+ 	IODelay(10);
++	dvfs();
+ 	return true;
+ }
+ 

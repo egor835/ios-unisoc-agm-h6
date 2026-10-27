@@ -1,0 +1,1664 @@
+agm-0969: AGM H6 Mali-G57: hardware layer (iokit/Kernel/arm/AgmMali.cpp: power and clocks after
+the vendor qogirl6 platform code, soft reset and G57 quirks, AS 0 with AArch64 4 KB page tables,
+an in-order job queue with polled completion, panfrost parameters; boot-arg agm_gpu_test=1 runs
+a WRITE_VALUE self test) and the AgmMaliGPU service with panfrost's interface for Mesa
+(AgmMaliGPU.cpp, boot-arg agm_gpu=1). GPU memory is cached kernel memory with explicit cache
+upkeep: contiguous or write-combined IOBMD allocations come from outside RAM here.
+
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index b5c09662f..3ce4a3a61 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -46,15 +46,8 @@
+  * defaults (VOREG differs) the setup is applied again. REG0 STAT bits 5:4
+  * (0 ready, 1 charging, 2 done, 3 fault) feed SweetBattery.
+  *
+- * GPU probe (step 1 of Mali-G57 support): power and clocks after the vendor
+- * platform code (Realme C53 kernel_modules/.../gpu/natt/mali/platform/qogirl6)
+- * and mainline ums9230-clk.c: AON APB gate gpu_eb (0x64000000 bit 11, set reg
+- * +0x1000), PMU 0x64020000 +0x2c4 bit 25 = top force shutdown (clear, then
+- * +0x500 bits 20:16 read 0 when the top domain is on), GPU APB 0x23000000:
+- * +0x0 soft resets (bits 0/1), +0x4 core / +0x8 mem clock (gate bit 0, mux
+- * bits 6:4 with 0 = 26 MHz, div bits 10:8), +0xc sys (gate bit 0, div 6:4).
+- * The Mali registers at 0x23100000 are only read once that is all on:
+- * GPU_ID 0x0, L2/TILER/SHADER features and present masks.
++ * GPU: boot-arg agm_gpu_test=1 runs the Mali self test (iokit/Kernel/arm/AgmMali.cpp),
++ * agm_gpu=1 starts the AgmMaliGPU service for Mesa's panfrost (AgmMaliGPU.cpp).
+  *
+  * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
+  * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
+@@ -508,59 +501,6 @@ agm_charger_status(void)
+ 	return agm_chg_stat;
+ }
+ 
+-#define AON_APB_PA		0x64000000UL
+-#define PMU_APB_PA		0x64020000UL
+-#define GPU_APB_PA		0x23000000UL
+-#define MALI_PA			0x23100000UL
+-
+-static void
+-agm_gpu_probe(void)
+-{
+-	vm_offset_t aon = ml_io_map(AON_APB_PA, 0x2000), pmu = ml_io_map(PMU_APB_PA, 0x1000);
+-	vm_offset_t gapb = ml_io_map(GPU_APB_PA, 0x1000), mali;
+-	uint32_t st = 0;
+-	int i;
+-
+-	if (aon == 0 || pmu == 0 || gapb == 0) {
+-		printf("AGM GPU: map failed\n");
+-		return;
+-	}
+-	printf("AGM GPU: before aon %#x pmu force %#x state %#x\n",
+-	    rd32(aon), rd32(pmu + 0x2c4), rd32(pmu + 0x500));
+-	wr32(aon + 0x1000, 1u << 11);				/* gpu_eb */
+-	wr32(pmu + 0x2c4, rd32(pmu + 0x2c4) & ~(1u << 25));	/* top power on */
+-	delay(100);
+-	for (i = 0; i < 200 && ((st = rd32(pmu + 0x500)) & (0x1fu << 16)); i++) {
+-		delay(50);
+-	}
+-	printf("AGM GPU: top power %s (state %#x, %d polls), gpu apb rst %#x core %#x mem %#x sys %#x\n",
+-	    (st & (0x1fu << 16)) ? "TIMEOUT" : "on", st, i, rd32(gapb), rd32(gapb + 0x4),
+-	    rd32(gapb + 0x8), rd32(gapb + 0xc));
+-	if (st & (0x1fu << 16)) {
+-		return;
+-	}
+-	wr32(gapb + 0x4, (rd32(gapb + 0x4) & ~0x770u) | 1u);	/* core: 26 MHz, gate on */
+-	wr32(gapb + 0x8, (rd32(gapb + 0x8) & ~0x770u) | 1u);	/* mem: 26 MHz, gate on */
+-	wr32(gapb + 0xc, (rd32(gapb + 0xc) & ~0x070u) | 1u);	/* sys: gate on */
+-	delay(200);
+-	if (rd32(gapb) & 3u) {
+-		wr32(gapb, rd32(gapb) & ~3u);			/* release soft resets */
+-		delay(10);
+-	}
+-	printf("AGM GPU: clocks core %#x mem %#x sys %#x rst %#x\n",
+-	    rd32(gapb + 0x4), rd32(gapb + 0x8), rd32(gapb + 0xc), rd32(gapb));
+-	mali = ml_io_map(MALI_PA, 0x4000);
+-	if (mali == 0) {
+-		return;
+-	}
+-	printf("AGM GPU: GPU_ID %#x L2 %#x TILER %#x MEM %#x MMU %#x AS %#x JS %#x\n",
+-	    rd32(mali + 0x0), rd32(mali + 0x4), rd32(mali + 0xc), rd32(mali + 0x10),
+-	    rd32(mali + 0x14), rd32(mali + 0x18), rd32(mali + 0x1c));
+-	printf("AGM GPU: shader present %#x tiler %#x l2 %#x, thread max %#x, coherency %#x\n",
+-	    rd32(mali + 0x100), rd32(mali + 0x110), rd32(mali + 0x120), rd32(mali + 0xa0),
+-	    rd32(mali + 0x300));
+-}
+-
+ static void
+ agm_gpio_input(unsigned n)
+ {
+@@ -799,8 +739,14 @@ agm_keys_init(void)
+ 			agm_chg_poll();
+ 		}
+ 	}
+-	if (PE_parse_boot_argn("agm_gpu_probe", &dmsk, sizeof(dmsk)) && dmsk != 0) {
+-		agm_gpu_probe();
++	if (PE_parse_boot_argn("agm_gpu_test", &dmsk, sizeof(dmsk)) && dmsk != 0) {
++		extern void agm_mali_selftest(void);
++		agm_mali_selftest();
++	}
++	dmsk = 0;
++	if (PE_parse_boot_argn("agm_gpu", &dmsk, sizeof(dmsk)) && dmsk != 0) {
++		extern void AgmMaliGPUStart(void);
++		AgmMaliGPUStart();
+ 	}
+ 	dmsk = 0;
+ 	if (pmic_read(EIC_DMSK, &dmsk)) {
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+new file mode 100644
+index 000000000..6b40c3bf8
+--- /dev/null
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -0,0 +1,882 @@
++/*
++ * AGM H6 (Unisoc UMS9230): the Mali-G57 MP1 (Valhall v9, job manager), the hardware half.
++ *
++ * Power and clocks after the vendor platform code (Realme C53 kernel_modules/kernel5.4/gpu/
++ * natt/mali/platform/qogirl6) and mainline ums9230-clk.c: AON APB gate gpu_eb (0x64000000
++ * bit 11, set register +0x1000), PMU 0x64020000 +0x2c4 bit 25 = top force shutdown (cleared;
++ * +0x500 bits 20:16 read 0 once the domain is on), GPU APB 0x23000000: +0x0 soft resets
++ * (bits 0/1), +0x4 core and +0x8 mem clocks (gate bit 0, mux bits 6:4: 26 MHz, 384, 512,
++ * 614.4, 768 MHz, GPLL; divider bits 10:8), +0xc sys clock (gate bit 0). The voltage is the
++ * top DVFS hardware's; the bootloader leaves the core clock on 384 MHz (DVFS index 0, 0.7 V),
++ * and that is kept unless boot-arg agm_gpu_mux says otherwise.
++ *
++ * The GPU itself after Linux's drm/panfrost (panfrost_gpu.c, _mmu.c, _job.c, _regs.h) with
++ * the G57's features and issues: soft reset, SC_VAR_ALGORITHM and the IDVS group size, L2,
++ * shader core and tiler powered on. One address space (AS 0) with AArch64 4 KB page tables
++ * (the G57 has HW_FEATURE_AARCH64_MMU), 48-bit GPU addresses; GPU memory is mapped
++ * cacheable for the GPU (inner shareable in the Mali sense: the GPU is not coherent with the
++ * processors here, system-coherency 31), every job cleans and invalidates the GPU's caches
++ * at its start and at its end. The processors map GPU buffers write-combined for programs;
++ * in the kernel they are ordinary cached memory (contiguous or write-combined allocations
++ * come from outside RAM in this kernel: phystokv panics), pushed out of the caches after the
++ * kernel writes them. Page tables likewise: every entry is cleaned to memory when written.
++ *
++ * Jobs: one job chain at a time on the whole GPU (slot 0 fragment, slot 1 everything else),
++ * strictly in the order given; completion is polled (JOB_INT_RAWSTAT) by whoever waits and
++ * by a kernel thread that starts the next chain. No interrupts yet.
++ *
++ * The C interface below is what the user client (AgmMaliGPU.cpp) and the boot self test use.
++ */
++
++#if defined(SWEET_AGM)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <mach/vm_param.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++bool agm_mali_ready(void);
++uint64_t agm_mali_param(uint32_t which);
++uint64_t agm_mali_va_alloc(uint64_t size, bool executable);
++void agm_mali_va_free(uint64_t va, uint64_t size);
++bool agm_mali_map(uint64_t va, uint64_t pa, uint32_t flags);
++void agm_mali_unmap(uint64_t va, uint64_t size);
++void agm_mali_flush(uint64_t va, uint64_t size);
++uint64_t agm_mali_submit(uint64_t jc, uint32_t requirements);
++bool agm_mali_done(uint64_t seqno);
++uint64_t agm_mali_last(void);
++bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
++void agm_mali_init(void);
++void agm_mali_selftest(void);
++}
++
++#define AGM_MALI_MAP_RO         1u
++#define AGM_MALI_MAP_NOEXEC     2u
++
++#define AON_APB_PA              0x64000000UL
++#define PMU_APB_PA              0x64020000UL
++#define GPU_APB_PA              0x23000000UL
++#define MALI_PA                 0x23100000UL
++
++/* panfrost_regs.h */
++#define GPU_ID                  0x000
++#define GPU_L2_FEATURES         0x004
++#define GPU_CORE_FEATURES       0x008
++#define GPU_TILER_FEATURES      0x00c
++#define GPU_MEM_FEATURES        0x010
++#define GPU_MMU_FEATURES        0x014
++#define GPU_AS_PRESENT          0x018
++#define GPU_JS_PRESENT          0x01c
++#define GPU_INT_RAWSTAT         0x020
++#define GPU_INT_CLEAR           0x024
++#define GPU_INT_MASK            0x028
++#define GPU_IRQ_FAULT           (1u << 0)
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_CMD                 0x030
++#define GPU_CMD_SOFT_RESET      0x01
++#define GPU_CMD_HARD_RESET      0x02
++#define GPU_STATUS              0x034
++#define GPU_LATEST_FLUSH_ID     0x038
++#define GPU_FAULT_STATUS        0x03c
++#define GPU_FAULT_ADDRESS_LO    0x040
++#define GPU_AFBC_FEATURES       0x04c
++#define GPU_TIMESTAMP_LO        0x098
++#define GPU_THREAD_MAX_THREADS  0x0a0
++#define GPU_THREAD_MAX_WORKGROUP_SIZE 0x0a4
++#define GPU_THREAD_MAX_BARRIER_SIZE 0x0a8
++#define GPU_THREAD_FEATURES     0x0ac
++#define GPU_TEXTURE_FEATURES(n) (0x0b0 + (n) * 4)
++#define GPU_JS_FEATURES(n)      (0x0c0 + (n) * 4)
++#define GPU_SHADER_PRESENT_LO   0x100
++#define GPU_TILER_PRESENT_LO    0x110
++#define GPU_L2_PRESENT_LO       0x120
++#define SHADER_READY_LO         0x140
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++#define SHADER_PWRON_LO         0x180
++#define TILER_PWRON_LO          0x190
++#define L2_PWRON_LO             0x1a0
++#define GPU_COHERENCY_FEATURES  0x300
++#define GPU_THREAD_TLS_ALLOC    0x310
++#define GPU_JM_CONFIG           0xf00
++#define GPU_SHADER_CONFIG       0xf04
++#define SC_VAR_ALGORITHM        (1u << 29)
++#define JM_IDVS_GROUP_SIZE      (0xfu << 16)
++
++#define JOB_INT_RAWSTAT         0x1000
++#define JOB_INT_CLEAR           0x1004
++#define JOB_INT_MASK            0x1008
++#define JS_BASE                 0x1800
++#define JS_HEAD_LO(n)           (JS_BASE + (n) * 0x80 + 0x00)
++#define JS_HEAD_HI(n)           (JS_BASE + (n) * 0x80 + 0x04)
++#define JS_TAIL_LO(n)           (JS_BASE + (n) * 0x80 + 0x08)
++#define JS_TAIL_HI(n)           (JS_BASE + (n) * 0x80 + 0x0c)
++#define JS_STATUS(n)            (JS_BASE + (n) * 0x80 + 0x24)
++#define JS_HEAD_NEXT_LO(n)      (JS_BASE + (n) * 0x80 + 0x40)
++#define JS_HEAD_NEXT_HI(n)      (JS_BASE + (n) * 0x80 + 0x44)
++#define JS_AFFINITY_NEXT_LO(n)  (JS_BASE + (n) * 0x80 + 0x50)
++#define JS_AFFINITY_NEXT_HI(n)  (JS_BASE + (n) * 0x80 + 0x54)
++#define JS_CONFIG_NEXT(n)       (JS_BASE + (n) * 0x80 + 0x58)
++#define JS_COMMAND_NEXT(n)      (JS_BASE + (n) * 0x80 + 0x60)
++#define JS_COMMAND_START        0x01
++#define JS_COMMAND_HARD_STOP    0x03
++#define JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE (3u << 8)
++#define JS_CONFIG_JOB_CHAIN_FLAG (1u << 11)
++#define JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE (3u << 12)
++#define JS_CONFIG_THREAD_PRI(n) ((n) << 16)
++
++#define MMU_INT_RAWSTAT         0x2000
++#define MMU_INT_CLEAR           0x2004
++#define MMU_INT_MASK            0x2008
++#define AS_BASE                 0x2400
++#define AS_TRANSTAB_LO          (AS_BASE + 0x00)
++#define AS_TRANSTAB_HI          (AS_BASE + 0x04)
++#define AS_MEMATTR_LO           (AS_BASE + 0x08)
++#define AS_MEMATTR_HI           (AS_BASE + 0x0c)
++#define AS_LOCKADDR_LO          (AS_BASE + 0x10)
++#define AS_LOCKADDR_HI          (AS_BASE + 0x14)
++#define AS_COMMAND              (AS_BASE + 0x18)
++#define AS_FAULTSTATUS          (AS_BASE + 0x1c)
++#define AS_FAULTADDRESS_LO      (AS_BASE + 0x20)
++#define AS_FAULTADDRESS_HI      (AS_BASE + 0x24)
++#define AS_STATUS               (AS_BASE + 0x28)
++#define AS_TRANSCFG_LO          (AS_BASE + 0x30)
++#define AS_TRANSCFG_HI          (AS_BASE + 0x34)
++#define AS_COMMAND_UPDATE       0x01
++#define AS_COMMAND_LOCK         0x02
++#define AS_COMMAND_UNLOCK       0x03
++#define AS_COMMAND_FLUSH_PT     0x04
++#define AS_COMMAND_FLUSH_MEM    0x05
++#define AS_STATUS_ACTIVE        0x01
++#define AS_TRANSCFG             ((2u << 24) /* PTW_MEMATTR_WB */ | (1u << 30) /* PTW_RA */ | \
++	                         6u /* ADRMODE_AARCH64_4K */ | ((55u - 48u) << 6) /* INA_BITS */)
++
++/* Memory attributes, as io-pgtable-arm's MAIR through panfrost's mair_to_memattr() (not coherent) */
++#define ATTR_NC                 0x4c    /* index 0: non-cacheable */
++#define ATTR_WB                 0x8f    /* index 1: write-back, read/write allocate, Mali inner shareable */
++#define ATTR_IDX_NC             0
++#define ATTR_IDX_WB             1
++
++/* AArch64 stage 1 descriptors (io-pgtable-arm) */
++#define PTE_TYPE_TABLE          3ull
++#define PTE_TYPE_PAGE           3ull
++#define PTE_ATTRINDX(i)         ((uint64_t)(i) << 2)
++#define PTE_AP_UNPRIV           (1ull << 6)
++#define PTE_AP_RDONLY           (1ull << 7)
++#define PTE_SH_IS               (3ull << 8)
++#define PTE_AF                  (1ull << 10)
++#define PTE_NG                  (1ull << 11)
++#define PTE_XN                  ((1ull << 54) | (1ull << 53))
++#define PTE_ADDR                0x0000fffffffff000ull
++
++/* GPU virtual addresses for buffers: panfrost's drm_mm range, 32 MB to 4 GB */
++#define VA_START                (32ull << 20)
++#define VA_END                  (4ull << 30)
++
++#define JOB_RING                64
++#define WAIT_POLL_US            100
++
++static volatile uint8_t *mali, *gapb, *pmu, *aon;
++static IOLock *hw_lock;
++static bool ready, broken;
++static uint32_t gpu_id, shader_present, tiler_present, l2_present;
++
++struct job {
++	uint64_t seqno, jc;
++	uint32_t requirements;
++};
++static struct job ring[JOB_RING];
++static uint64_t next_seqno = 1, done_seqno, running_seqno;      /* running: 0 = idle */
++static uint32_t ring_head, ring_count;
++static uint32_t running_slot;
++static uint64_t running_since;
++static uint64_t jobs_done, jobs_failed;
++static thread_t kick_thread;
++
++static inline uint32_t
++rd(uint32_t o)
++{
++	return *(volatile uint32_t *)(mali + o);
++}
++
++static inline void
++wr(uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(mali + o) = v;
++}
++
++static bool
++poll(uint32_t o, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i <= us; i++) {
++		if ((rd(o) & mask) == want) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++/* ---------------------------------------------------------------- memory */
++
++/* Kernel memory for the GPU's own structures (page tables, the self test): cached, cleaned by hand. */
++struct kmem {
++	IOBufferMemoryDescriptor *md;
++	uint8_t *va;
++	uint64_t size;
++};
++
++static bool
++kmem_alloc(struct kmem *m, uint64_t size)
++{
++	size = round_page_64(size);
++	m->md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, (vm_size_t)size, PAGE_SIZE);
++	if (m->md == NULL) {
++		return false;
++	}
++	m->va = (uint8_t *)m->md->getBytesNoCopy();
++	m->size = size;
++	bzero(m->va, (size_t)size);
++	sweet_dcache_flush((vm_offset_t)m->va, (unsigned)size);
++	return true;
++}
++
++static uint64_t
++kmem_pa(struct kmem *m, uint64_t off)
++{
++	return m->md->getPhysicalSegment(off, NULL, kIOMemoryMapperNone);
++}
++
++/* Page tables: 4 KB tables carved from 16 KB pages, never given back. */
++struct table {
++	uint64_t *va;
++	uint64_t pa;
++};
++static struct table l0, l1;                     /* 48-bit: one L0, and one L1 for the first 512 GB */
++static struct table l2[4];                      /* the first 4 GB: an L2 per GB */
++static struct table *l3[2048];                  /* an L3 per 2 MB */
++static struct kmem table_chunk;
++static uint32_t table_chunk_used = PAGE_SIZE / 4096;
++
++static bool
++table_alloc(struct table *t)
++{
++	if (table_chunk_used == PAGE_SIZE / 4096) {
++		struct kmem m = {};
++		if (!kmem_alloc(&m, PAGE_SIZE)) {
++			return false;
++		}
++		table_chunk = m;
++		table_chunk_used = 0;
++	}
++	t->va = (uint64_t *)(table_chunk.va + 4096 * table_chunk_used);
++	t->pa = kmem_pa(&table_chunk, 4096 * table_chunk_used);
++	table_chunk_used++;
++	return true;
++}
++
++static void
++pte_set(uint64_t *p, uint64_t v)
++{
++	*(volatile uint64_t *)p = v;
++	sweet_dcache_clean((vm_offset_t)p, 8);
++}
++
++static uint64_t *
++l3_for(uint64_t va, bool create)
++{
++	uint32_t i1 = (uint32_t)(va >> 30), i2 = (uint32_t)((va >> 21) & 511), i3 = (uint32_t)(va >> 21);
++
++	if (va >= VA_END) {
++		return NULL;
++	}
++	if (l2[i1].va == NULL) {
++		if (!create || !table_alloc(&l2[i1])) {
++			return NULL;
++		}
++		pte_set(&l1.va[i1], l2[i1].pa | PTE_TYPE_TABLE);
++	}
++	if (l3[i3] == NULL) {
++		struct table *t = (struct table *)IOMalloc(sizeof(*t));
++		if (!create || t == NULL || !table_alloc(t)) {
++			if (t != NULL) {
++				IOFree(t, sizeof(*t));
++			}
++			return NULL;
++		}
++		l3[i3] = t;
++		pte_set(&l2[i1].va[i2], t->pa | PTE_TYPE_TABLE);
++	}
++	return l3[i3]->va;
++}
++
++/* ---------------------------------------------------------------- MMU (AS 0) */
++
++static bool
++as_wait(void)
++{
++	if (poll(AS_STATUS, AS_STATUS_ACTIVE, 0, 100000)) {
++		return true;
++	}
++	IOLog("AGM MALI: AS 0 stays active (status %#x)\n", rd(AS_STATUS));
++	broken = true;
++	return false;
++}
++
++static void
++as_cmd(uint32_t cmd)
++{
++	if (as_wait()) {
++		wr(AS_COMMAND, cmd);
++	}
++}
++
++/* lock_region() of panfrost_mmu.c: a naturally aligned power of two holding [va, va + size) */
++static void
++as_lock(uint64_t va, uint64_t size)
++{
++	uint64_t end = va + size - 1;
++	uint32_t width = 15;
++
++	for (uint32_t b = 63; b > 0; b--) {
++		if ((va ^ end) & (1ull << b)) {
++			width = b + 1 > 15 ? b + 1 : 15;
++			break;
++		}
++	}
++	width -= 1;
++	uint64_t region = (va & ~((1ull << width) - 1)) | width;
++	wr(AS_LOCKADDR_LO, (uint32_t)region);
++	wr(AS_LOCKADDR_HI, (uint32_t)(region >> 32));
++	as_cmd(AS_COMMAND_LOCK);
++}
++
++static void
++as_op(uint64_t va, uint64_t size, uint32_t op)
++{
++	as_lock(va, size);
++	as_cmd(op);
++	as_wait();
++}
++
++static bool
++mmu_setup(void)
++{
++	uint64_t memattr = 0;
++
++	if (l0.va == NULL && (!table_alloc(&l0) || !table_alloc(&l1))) {
++		return false;
++	}
++	pte_set(&l0.va[0], l1.pa | PTE_TYPE_TABLE);
++	for (int i = 0; i < 8; i++) {
++		memattr |= (uint64_t)(i == ATTR_IDX_WB ? ATTR_WB : ATTR_NC) << (8 * i);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	as_op(0, ~0ull, AS_COMMAND_FLUSH_MEM);
++	wr(AS_TRANSTAB_LO, (uint32_t)l0.pa);
++	wr(AS_TRANSTAB_HI, (uint32_t)(l0.pa >> 32));
++	wr(AS_MEMATTR_LO, (uint32_t)memattr);
++	wr(AS_MEMATTR_HI, (uint32_t)(memattr >> 32));
++	wr(AS_TRANSCFG_LO, AS_TRANSCFG);
++	wr(AS_TRANSCFG_HI, 0);
++	as_cmd(AS_COMMAND_UPDATE);
++	as_wait();
++	wr(MMU_INT_CLEAR, 0xffffffff);
++	wr(MMU_INT_MASK, 0);
++	return true;
++}
++
++bool
++agm_mali_map(uint64_t va, uint64_t pa, uint32_t flags)
++{
++	uint64_t *t = l3_for(va, true);
++
++	if (t == NULL || (pa & 0xfff) || (pa >> 40) != 0) {
++		return false;
++	}
++	pte_set(&t[(va >> 12) & 511], (pa & PTE_ADDR) | PTE_TYPE_PAGE | PTE_ATTRINDX(ATTR_IDX_WB) | PTE_SH_IS |
++	    PTE_AF | PTE_NG | PTE_AP_UNPRIV | ((flags & AGM_MALI_MAP_RO) ? PTE_AP_RDONLY : 0) |
++	    ((flags & AGM_MALI_MAP_NOEXEC) ? PTE_XN : 0));
++	return true;
++}
++
++void
++agm_mali_unmap(uint64_t va, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += 4096) {
++		uint64_t *t = l3_for(va + off, false);
++		if (t != NULL) {
++			pte_set(&t[((va + off) >> 12) & 511], 0);
++		}
++	}
++}
++
++/* After map/unmap: the GPU's L2 and TLBs forget what they knew of [va, va + size). */
++void
++agm_mali_flush(uint64_t va, uint64_t size)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!ready || size == 0) {
++		return;
++	}
++	IOLockLock(hw_lock);
++	as_op(va, size, AS_COMMAND_FLUSH_PT);
++	IOLockUnlock(hw_lock);
++}
++
++/* GPU virtual addresses (range allocator from darwin-redwood's) */
++static struct { uint64_t start, size; } va_free[1024];
++static unsigned va_free_count;
++
++uint64_t
++agm_mali_va_alloc(uint64_t size, bool executable)
++{
++	uint64_t align = size >= (2ull << 20) ? (2ull << 20) : 0x10000;
++
++	size = (size + 0xffff) & ~0xffffull;
++	IOLockLock(hw_lock);
++	for (unsigned i = 0; i < va_free_count; i++) {
++		uint64_t start = (va_free[i].start + align - 1) & ~(align - 1);
++		uint64_t skip = start - va_free[i].start;
++
++		if (va_free[i].size < skip + size) {
++			continue;
++		}
++		/* an executable buffer must not cross a 4 GB line (panfrost: shaders); all are below 4 GB */
++		(void)executable;
++		if (skip != 0) {
++			/* split: keep the part before the aligned start free */
++			if (va_free_count == sizeof(va_free) / sizeof(va_free[0])) {
++				continue;
++			}
++			memmove(&va_free[i + 1], &va_free[i], (va_free_count - i) * sizeof(va_free[0]));
++			va_free_count++;
++			va_free[i].size = skip;
++			i++;
++			va_free[i].start = start;
++			va_free[i].size -= skip;
++		}
++		va_free[i].start += size;
++		va_free[i].size -= size;
++		if (va_free[i].size == 0) {
++			memmove(&va_free[i], &va_free[i + 1], (--va_free_count - i) * sizeof(va_free[0]));
++		}
++		IOLockUnlock(hw_lock);
++		return start;
++	}
++	IOLockUnlock(hw_lock);
++	return 0;
++}
++
++void
++agm_mali_va_free(uint64_t address, uint64_t size)
++{
++	unsigned at;
++
++	size = (size + 0xffff) & ~0xffffull;
++	IOLockLock(hw_lock);
++	for (at = 0; at < va_free_count && va_free[at].start < address; at++) {
++	}
++	if (at > 0 && va_free[at - 1].start + va_free[at - 1].size == address) {
++		va_free[at - 1].size += size;
++		if (at < va_free_count && address + size == va_free[at].start) {
++			va_free[at - 1].size += va_free[at].size;
++			memmove(&va_free[at], &va_free[at + 1], (--va_free_count - at) * sizeof(va_free[0]));
++		}
++	} else if (at < va_free_count && address + size == va_free[at].start) {
++		va_free[at].start = address;
++		va_free[at].size += size;
++	} else if (va_free_count < sizeof(va_free) / sizeof(va_free[0])) {
++		memmove(&va_free[at + 1], &va_free[at], (va_free_count - at) * sizeof(va_free[0]));
++		va_free_count++;
++		va_free[at].start = address;
++		va_free[at].size = size;
++	}
++	IOLockUnlock(hw_lock);
++}
++
++/* ---------------------------------------------------------------- power, reset */
++
++static bool
++power_up(void)
++{
++	vm_offset_t a = ml_io_map(AON_APB_PA, 0x2000), p = ml_io_map(PMU_APB_PA, 0x1000);
++	vm_offset_t g = ml_io_map(GPU_APB_PA, 0x1000);
++	uint32_t st = 0, mux = 0xff;
++	int i;
++
++	if (a == 0 || p == 0 || g == 0) {
++		return false;
++	}
++	aon = (volatile uint8_t *)a;
++	pmu = (volatile uint8_t *)p;
++	gapb = (volatile uint8_t *)g;
++	*(volatile uint32_t *)(aon + 0x1000) = 1u << 11;                       /* gpu_eb */
++	*(volatile uint32_t *)(pmu + 0x2c4) &= ~(1u << 25);                    /* top power on */
++	IODelay(100);
++	for (i = 0; i < 200 && ((st = *(volatile uint32_t *)(pmu + 0x500)) & (0x1fu << 16)); i++) {
++		IODelay(50);
++	}
++	if (st & (0x1fu << 16)) {
++		IOLog("AGM MALI: GPU top power domain did not come on (state %#x)\n", st);
++		return false;
++	}
++	(void)PE_parse_boot_argn("agm_gpu_mux", &mux, sizeof(mux));
++	for (uint32_t r = 0x4; r <= 0x8; r += 4) {
++		uint32_t v = *(volatile uint32_t *)(gapb + r);
++		if (mux <= 5) {
++			v = (v & ~0x770u) | (mux << 4);
++		}
++		*(volatile uint32_t *)(gapb + r) = v | 1u;                      /* core, mem: gate on */
++	}
++	*(volatile uint32_t *)(gapb + 0xc) |= 1u;                              /* sys: gate on */
++	IODelay(200);
++	*(volatile uint32_t *)gapb &= ~3u;                                     /* soft resets released */
++	IODelay(10);
++	return true;
++}
++
++static bool
++gpu_reset(void)
++{
++	wr(GPU_INT_MASK, 0);
++	wr(GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
++	wr(GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 10000)) {
++		IOLog("AGM MALI: soft reset timed out, trying a hard one\n");
++		wr(GPU_CMD, GPU_CMD_HARD_RESET);
++		if (!poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100000)) {
++			IOLog("AGM MALI: hard reset timed out\n");
++			return false;
++		}
++	}
++	wr(GPU_INT_CLEAR, 0xffffffff);
++	wr(GPU_INT_MASK, 0);
++	wr(JOB_INT_CLEAR, 0xffffffff);
++	wr(JOB_INT_MASK, 0);
++
++	/* panfrost_gpu_init_quirks() for the G57: TTRX_2968_TTRX_3162, IDVS group size */
++	wr(GPU_SHADER_CONFIG, SC_VAR_ALGORITHM);
++	wr(GPU_JM_CONFIG, JM_IDVS_GROUP_SIZE);
++
++	wr(L2_PWRON_LO, l2_present);
++	if (!poll(L2_READY_LO, 0xffffffff, l2_present, 20000)) {
++		IOLog("AGM MALI: L2 did not power up (ready %#x)\n", rd(L2_READY_LO));
++		return false;
++	}
++	wr(SHADER_PWRON_LO, shader_present);
++	if (!poll(SHADER_READY_LO, 0xffffffff, shader_present, 20000)) {
++		IOLog("AGM MALI: shader cores did not power up (ready %#x)\n", rd(SHADER_READY_LO));
++		return false;
++	}
++	wr(TILER_PWRON_LO, tiler_present);
++	if (!poll(TILER_READY_LO, 0xffffffff, tiler_present, 1000)) {
++		IOLog("AGM MALI: tiler did not power up (ready %#x)\n", rd(TILER_READY_LO));
++		return false;
++	}
++	return mmu_setup();
++}
++
++/* ---------------------------------------------------------------- jobs */
++
++static void
++report_faults(const char *why)
++{
++	IOLog("AGM MALI: %s: gpu int %#x fault %#x at %#x, job int %#x, js0 status %#x head %#x%08x, js1 status %#x "
++	    "head %#x%08x tail %#x%08x, mmu int %#x, as0 fault %#x at %#x%08x, as0 status %#x\n", why,
++	    rd(GPU_INT_RAWSTAT), rd(GPU_FAULT_STATUS), rd(GPU_FAULT_ADDRESS_LO), rd(JOB_INT_RAWSTAT),
++	    rd(JS_STATUS(0)), rd(JS_HEAD_HI(0)), rd(JS_HEAD_LO(0)), rd(JS_STATUS(1)), rd(JS_HEAD_HI(1)),
++	    rd(JS_HEAD_LO(1)), rd(JS_TAIL_HI(1)), rd(JS_TAIL_LO(1)), rd(MMU_INT_RAWSTAT), rd(AS_FAULTSTATUS),
++	    rd(AS_FAULTADDRESS_HI), rd(AS_FAULTADDRESS_LO), rd(AS_STATUS));
++}
++
++/* With hw_lock held: the GPU idle and a job waiting: start it. */
++static void
++start_next(void)
++{
++	if (running_seqno != 0 || ring_count == 0 || broken) {
++		return;
++	}
++	struct job *j = &ring[ring_head];
++	uint32_t slot = (j->requirements & 1) ? 0 : 1;          /* PANFROST_JD_REQ_FS: fragment, slot 0 */
++
++	if (rd(JS_COMMAND_NEXT(slot)) != 0) {
++		return;
++	}
++	wr(JS_HEAD_NEXT_LO(slot), (uint32_t)j->jc);
++	wr(JS_HEAD_NEXT_HI(slot), (uint32_t)(j->jc >> 32));
++	wr(JS_AFFINITY_NEXT_LO(slot), shader_present);
++	wr(JS_AFFINITY_NEXT_HI(slot), 0);
++	wr(JS_CONFIG_NEXT(slot), 0 /* AS 0 */ | JS_CONFIG_THREAD_PRI(8) | JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE |
++	    JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE | ((j->seqno & 1) ? JS_CONFIG_JOB_CHAIN_FLAG : 0));
++	running_seqno = j->seqno;
++	running_slot = slot;
++	running_since = mach_absolute_time();
++	wr(JS_COMMAND_NEXT(slot), JS_COMMAND_START);
++	ring_head = (ring_head + 1) % JOB_RING;
++	ring_count--;
++}
++
++/* With hw_lock held: has the running job ended? Then the next one starts. */
++static void
++check(void)
++{
++	if (running_seqno == 0) {
++		start_next();
++		return;
++	}
++	uint32_t raw = rd(JOB_INT_RAWSTAT), slot = running_slot;
++	uint32_t mmu = rd(MMU_INT_RAWSTAT);
++
++	if (mmu != 0) {
++		static uint32_t told;
++		if (told++ < 8) {
++			report_faults("GPU MMU fault");
++		}
++		/* the job will fail on it: the fault is let go of, as panfrost does for one it cannot mend */
++		wr(MMU_INT_CLEAR, mmu);
++	}
++	if (raw & ((1u << slot) | (1u << (16 + slot)))) {
++		if (raw & (1u << (16 + slot))) {
++			static uint32_t told;
++			jobs_failed++;
++			if (told++ < 16) {
++				report_faults("job failed");
++			}
++		} else {
++			jobs_done++;
++		}
++		wr(JOB_INT_CLEAR, (1u << slot) | (1u << (16 + slot)));
++		done_seqno = running_seqno;
++		running_seqno = 0;
++		start_next();
++		return;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - running_since, &ns);
++	if (ns > 2 * NSEC_PER_SEC) {
++		report_faults("job takes over 2 s: stopped");
++		wr(JS_BASE + slot * 0x80 + 0x20, JS_COMMAND_HARD_STOP);
++		IODelay(1000);
++		wr(JOB_INT_CLEAR, 0xffffffff);
++		jobs_failed++;
++		done_seqno = running_seqno;
++		running_seqno = 0;
++		start_next();
++	}
++}
++
++/* requirements: panfrost's (bit 0 PANFROST_JD_REQ_FS). 0: no room or no GPU. */
++uint64_t
++agm_mali_submit(uint64_t jc, uint32_t requirements)
++{
++	uint64_t seqno = 0;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLockLock(hw_lock);
++	if (ready && !broken && ring_count < JOB_RING) {
++		struct job *j = &ring[(ring_head + ring_count) % JOB_RING];
++		j->seqno = seqno = next_seqno++;
++		j->jc = jc;
++		j->requirements = requirements;
++		ring_count++;
++		check();
++	}
++	IOLockUnlock(hw_lock);
++	if (seqno != 0 && kick_thread != NULL) {
++		thread_wakeup(&ring_count);
++	}
++	return seqno;
++}
++
++bool
++agm_mali_done(uint64_t seqno)
++{
++	bool done;
++
++	IOLockLock(hw_lock);
++	if (done_seqno < seqno) {
++		check();
++	}
++	done = done_seqno >= seqno || broken;
++	IOLockUnlock(hw_lock);
++	return done;
++}
++
++uint64_t
++agm_mali_last(void)
++{
++	return next_seqno - 1;
++}
++
++bool
++agm_mali_wait(uint64_t seqno, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	while (!agm_mali_done(seqno)) {
++		if (mach_absolute_time() - began >= patience) {
++			return false;
++		}
++		delay_for_interval(WAIT_POLL_US, NSEC_PER_USEC);
++	}
++	return !broken;
++}
++
++/* Starts queued jobs when nobody waits for them. */
++static void
++kick_loop(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	for (;;) {
++		IOLockLock(hw_lock);
++		check();
++		bool busy = running_seqno != 0 || ring_count != 0;
++		IOLockUnlock(hw_lock);
++		if (busy) {
++			delay_for_interval(WAIT_POLL_US, NSEC_PER_USEC);
++		} else {
++			assert_wait_timeout(&ring_count, THREAD_UNINT, 100, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++}
++
++/* ---------------------------------------------------------------- parameters (panfrost_drm.h) */
++
++bool
++agm_mali_ready(void)
++{
++	return ready && !broken;
++}
++
++uint64_t
++agm_mali_param(uint32_t which)
++{
++	switch (which) {
++	case 0: return gpu_id >> 16;                            /* GPU_PROD_ID */
++	case 1: return gpu_id & 0xffff;                         /* GPU_REVISION */
++	case 2: return shader_present;
++	case 3: return tiler_present;
++	case 4: return l2_present;
++	case 5: return 0;                                       /* STACK_PRESENT */
++	case 6: return 0xff;                                    /* AS_PRESENT */
++	case 7: return 0x7;                                     /* JS_PRESENT */
++	case 8: return rd(GPU_L2_FEATURES);
++	case 9: return rd(GPU_CORE_FEATURES);
++	case 10: return rd(GPU_TILER_FEATURES);
++	case 11: return rd(GPU_MEM_FEATURES);
++	case 12: return rd(GPU_MMU_FEATURES);
++	case 13: return rd(GPU_THREAD_FEATURES);
++	case 14: return rd(GPU_THREAD_MAX_THREADS);
++	case 15: return rd(GPU_THREAD_MAX_WORKGROUP_SIZE);
++	case 16: return rd(GPU_THREAD_MAX_BARRIER_SIZE);
++	case 17: return rd(GPU_COHERENCY_FEATURES);
++	case 18: case 19: case 20: case 21:
++		return rd(GPU_TEXTURE_FEATURES(which - 18));
++	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29:
++	case 30: case 31: case 32: case 33: case 34: case 35: case 36: case 37:
++		return rd(GPU_JS_FEATURES(which - 22));
++	case 38: return 0;                                      /* NR_CORE_GROUPS */
++	case 39: return rd(GPU_THREAD_TLS_ALLOC);
++	case 40: return rd(GPU_AFBC_FEATURES);
++	default: return ~0ull;
++	}
++}
++
++/* ---------------------------------------------------------------- start */
++
++void
++agm_mali_init(void)
++{
++	if (ready || mali != NULL) {
++		return;
++	}
++	hw_lock = IOLockAlloc();
++	if (hw_lock == NULL || !power_up()) {
++		return;
++	}
++	mali = (volatile uint8_t *)ml_io_map(MALI_PA, 0x4000);
++	if (mali == NULL) {
++		return;
++	}
++	gpu_id = rd(GPU_ID);
++	shader_present = rd(GPU_SHADER_PRESENT_LO);
++	tiler_present = rd(GPU_TILER_PRESENT_LO);
++	l2_present = rd(GPU_L2_PRESENT_LO);
++	va_free[0].start = VA_START;
++	va_free[0].size = VA_END - VA_START;
++	va_free_count = 1;
++	if (!gpu_reset()) {
++		IOLog("AGM MALI: GPU %#x did not come up\n", gpu_id);
++		return;
++	}
++	ready = true;
++	if (kernel_thread_start(kick_loop, NULL, &kick_thread) == KERN_SUCCESS) {
++		thread_deallocate(kick_thread);
++	} else {
++		kick_thread = NULL;
++	}
++	IOLog("AGM MALI: GPU %#x up: shaders %#x tiler %#x l2 %#x, core clock reg %#x, AS 0 transtab %#llx\n",
++	    gpu_id, shader_present, tiler_present, l2_present, *(volatile uint32_t *)(gapb + 0x4), l0.pa);
++}
++
++/*
++ * Boot-arg agm_gpu_test=1: a WRITE_VALUE job (Valhall v9 job header, 32 bytes, then the
++ * payload: address, type 6 = immediate 32, value) writes a word the processor then reads.
++ */
++void
++agm_mali_selftest(void)
++{
++	struct kmem m = {};
++	uint64_t va, seq;
++	bool ok;
++
++	agm_mali_init();
++	if (!agm_mali_ready()) {
++		IOLog("AGM MALI TEST: no GPU\n");
++		return;
++	}
++	if (!kmem_alloc(&m, PAGE_SIZE) || (va = agm_mali_va_alloc(PAGE_SIZE, false)) == 0) {
++		IOLog("AGM MALI TEST: no memory\n");
++		return;
++	}
++	for (uint64_t off = 0; off < PAGE_SIZE; off += 4096) {
++		agm_mali_map(va + off, kmem_pa(&m, off), AGM_MALI_MAP_NOEXEC);
++	}
++	agm_mali_flush(va, PAGE_SIZE);
++
++	volatile uint32_t *w = (volatile uint32_t *)m.va;
++	w[4] = 1u | (2u << 1) | (1u << 16);         /* 64-bit, type WRITE_VALUE, index 1 */
++	w[5] = 0;                                   /* no dependencies */
++	w[6] = w[7] = 0;                            /* next: none */
++	*(volatile uint64_t *)(m.va + 32) = va + 0x100;
++	w[10] = 6;                                  /* immediate 32 */
++	*(volatile uint64_t *)(m.va + 48) = 0xc0ffee42u;
++	w[0x100 / 4] = 0x11111111;
++	sweet_dcache_clean((vm_offset_t)m.va, PAGE_SIZE);
++
++	uint64_t t0 = mach_absolute_time(), ns;
++	seq = agm_mali_submit(va, 0);
++	ok = seq != 0 && agm_mali_wait(seq, 1000);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	sweet_dcache_flush((vm_offset_t)m.va, PAGE_SIZE);
++	IOLog("AGM MALI TEST: job %llu %s in %llu us: word %#x (want 0xc0ffee42), header status %#x, "
++	    "done %llu failed %llu\n", seq, ok ? "done" : "NOT done", ns / 1000, w[0x100 / 4], w[0], jobs_done, jobs_failed);
++	if (!ok || w[0x100 / 4] != 0xc0ffee42u) {
++		report_faults("self test");
++	}
++}
++#endif /* SWEET_AGM */
+diff --git a/iokit/Kernel/arm/AgmMaliGPU.cpp b/iokit/Kernel/arm/AgmMaliGPU.cpp
+new file mode 100644
+index 000000000..f67953195
+--- /dev/null
++++ b/iokit/Kernel/arm/AgmMaliGPU.cpp
+@@ -0,0 +1,650 @@
++/*
++ * AGM H6: the Mali-G57 for programs to draw with (after topaz's RedwoodGPU.cpp, which is
++ * vcvkk/darwin-redwood's, and Linux's drm/panfrost interface).
++ *
++ * A program that opens the service AgmMaliGPU speaks the interface of Linux's panfrost DRM
++ * driver, the one Mesa's panfrost knows: every request is a call of the user client with the
++ * request's number (the low byte of the ioctl code) as the selector and its structure passed
++ * in and back (userland: redwood-drm built for panfrost). mmap() of a buffer is the client
++ * memory of the type that is the buffer's handle. The hardware is AgmMali.cpp.
++ *
++ * Buffers: wired kernel memory, mapped write-combined into programs (the GPU is not coherent
++ * with the processors); in the kernel it is ordinary memory, its zeroes pushed out of the
++ * caches once when made (write-combined or contiguous allocations come from outside RAM in
++ * this kernel), and the kernel does not touch it after that. Entered page by page into the GPU's address space at an address chosen here
++ * (32 MB - 4 GB). A heap buffer (PANFROST_BO_HEAP, the tiler heap) gets all its memory at
++ * once instead of on GPU faults; nobody maps it.
++ *
++ * Differences from Linux, for the userland stand-in to cover:
++ *  - SUBMIT answers with the submission's sequence number in out_sync; sync objects are the
++ *    stand-in's own (a sync object is the sequence number it was last given), and so is the
++ *    wait on in_syncs (before the submission is made);
++ *  - WAIT_BO's timeout is relative, in nanoseconds (the stand-in converts Linux's absolute
++ *    CLOCK_MONOTONIC time); kAgmWaitSeqno waits for a sequence number, the same way;
++ *  - kAgmSurface (0x7e, as RedwoodGPU's) makes a buffer of an IOSurface's memory.
++ *
++ * Jobs run one at a time in the order given (AgmMali.cpp), so the order Linux gets from its
++ * implicit fences on buffers is there anyway.
++ */
++
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET_AGM)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/proc.h>
++
++#include "SweetSurface.h"
++
++extern "C" {
++void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
++bool agm_mali_ready(void);
++uint64_t agm_mali_param(uint32_t which);
++uint64_t agm_mali_va_alloc(uint64_t size, bool executable);
++void agm_mali_va_free(uint64_t va, uint64_t size);
++bool agm_mali_map(uint64_t va, uint64_t pa, uint32_t flags);
++void agm_mali_unmap(uint64_t va, uint64_t size);
++void agm_mali_flush(uint64_t va, uint64_t size);
++uint64_t agm_mali_submit(uint64_t jc, uint32_t requirements);
++bool agm_mali_done(uint64_t seqno);
++uint64_t agm_mali_last(void);
++bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
++void agm_mali_init(void);
++
++void AgmMaliGPUStart(void);
++}
++
++#define AGM_MALI_MAP_RO         1u
++#define AGM_MALI_MAP_NOEXEC     2u
++
++enum {
++	kDrmGemClose            = 0x09,
++	kPanSubmit              = 0x40,
++	kPanWaitBo              = 0x41,
++	kPanCreateBo            = 0x42,
++	kPanMmapBo              = 0x43,
++	kPanGetParam            = 0x44,
++	kPanGetBoOffset         = 0x45,
++	kPanPerfcntEnable       = 0x46,
++	kPanPerfcntDump         = 0x47,
++	kPanMadvise             = 0x48,
++	kPanSetLabelBo          = 0x49,
++	kAgmWaitSeqno           = 0x7d,         /* ours: wait for a submission */
++	kAgmSurface             = 0x7e,         /* ours: an IOSurface's memory as a buffer */
++};
++
++#define PANFROST_BO_NOEXEC      1
++#define PANFROST_BO_HEAP        2
++#define PANFROST_JD_REQ_FS      1
++
++struct pan_submit {
++	uint64_t jc, in_syncs;
++	uint32_t in_sync_count, out_sync;       /* out_sync: back, the sequence number */
++	uint64_t bo_handles;
++	uint32_t bo_handle_count, requirements;
++};
++struct pan_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;                     /* relative here */
++};
++struct pan_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++struct pan_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++struct pan_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++struct pan_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++struct pan_madvise {
++	uint32_t handle, madv, retained;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct agm_wait_seqno {
++	uint64_t seqno;
++	int64_t timeout_ns;                     /* relative; < 0: forever (GPU_PATIENCE_MS) */
++};
++struct agm_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kAgmDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++	uint64_t gpuAddress;                    /* back: where the GPU sees it */
++};
++#define kAgmDescribe            0xffffffffu
++
++#define GPU_BUFFERS             8192
++#define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_SUBMIT_BOS          8192
++#define GPU_PATIENCE_MS         5000
++
++static IOLock *gLock;
++
++struct gpu_buffer {
++	IOMemoryDescriptor *memory;             /* NULL: this handle is free */
++	uint8_t *kernel;
++	SweetSurface *surface;                  /* whose memory it is, when not its own */
++	uint64_t address, size;                 /* the GPU's */
++	uint32_t flags;
++	bool seen;                              /* mapped by the program */
++	uint64_t seqno;                         /* the last submission that names it */
++};
++
++class AgmMaliGPU : public IOService
++{
++	OSDeclareDefaultStructors(AgmMaliGPU);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AgmMaliGPU, IOService);
++
++bool
++AgmMaliGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AgmMaliGPUUserClient");
++	setName("AgmMaliGPU");
++	registerService();
++	return true;
++}
++
++void
++AgmMaliGPUStart(void)
++{
++	IOService *provider = IOService::getPlatform();
++	AgmMaliGPU *gpu;
++
++	agm_mali_init();
++	if (!agm_mali_ready()) {
++		IOLog("AgmMaliGPU: no GPU, no service\n");
++		return;
++	}
++	gLock = IOLockAlloc();
++	gpu = OSTypeAlloc(AgmMaliGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("AgmMaliGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("AgmMaliGPU: the service did not start\n");
++	}
++	gpu->release();
++	IOLog("AgmMaliGPU: service up\n");
++}
++
++class AgmMaliGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AgmMaliGPUUserClient);
++
++	struct gpu_buffer *fBuffers;            /* handle n is fBuffers[n - 1] */
++	uint32_t fNextBuffer, fBufferCount;
++	uint64_t fBufferBytes;
++	uint32_t fSubmits, fStrangers;
++
++	struct gpu_buffer *buffer(uint32_t handle);
++	struct gpu_buffer *newBuffer(IOMemoryDescriptor *memory, uint64_t size, uint32_t flags, uint32_t *handle);
++	void freeBuffer(struct gpu_buffer *b);
++	IOReturn createBo(struct pan_create_bo *r);
++	IOReturn surfaceBuffer(struct agm_surface *r);
++	IOReturn submit(struct pan_submit *r);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AgmMaliGPUUserClient, IOUserClient);
++
++bool
++AgmMaliGPUUserClient::start(IOService *provider)
++{
++	if (!agm_mali_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	static uint32_t opens;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (opens++ < 32) {
++		IOLog("AgmMaliGPU: client %s (open %u)\n", name, opens);
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	return fBuffers != NULL;
++}
++
++/* With the lock held. A buffer the GPU may still use is waited for (jobs are short). */
++void
++AgmMaliGPUUserClient::freeBuffer(struct gpu_buffer *b)
++{
++	if (b->seqno != 0 && !agm_mali_done(b->seqno)) {
++		IOLockUnlock(gLock);
++		bool done = agm_mali_wait(b->seqno, 1000);
++		IOLockLock(gLock);
++		if (!done) {
++			static uint32_t said;
++			if (said++ < 8) {
++				IOLog("AgmMaliGPU: the GPU is not done with a buffer of %llu bytes: it stays the GPU's\n", b->size);
++			}
++			b->memory = NULL;               /* (leaked on purpose: the GPU may yet write it) */
++			b->surface = NULL;
++			fBufferCount--;
++			fBufferBytes -= b->size;
++			return;
++		}
++	}
++	agm_mali_unmap(b->address, b->size);
++	agm_mali_flush(b->address, b->size);
++	agm_mali_va_free(b->address, b->size);
++	OSSafeReleaseNULL(b->memory);
++	OSSafeReleaseNULL(b->surface);
++	fBufferCount--;
++	fBufferBytes -= b->size;
++}
++
++IOReturn
++AgmMaliGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		agm_mali_wait(agm_mali_last(), 1000);
++		IOLockLock(gLock);
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		IOLockUnlock(gLock);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++AgmMaliGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct gpu_buffer *
++AgmMaliGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		if (handle != 0 && fStrangers++ < 16) {
++			IOLog("AgmMaliGPU: buffer %u is asked for and is not there\n", handle);
++		}
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/* A handle and GPU addresses for `size` bytes of `memory` (wired). With the lock held; NULL: no room. */
++struct gpu_buffer *
++AgmMaliGPUUserClient::newBuffer(IOMemoryDescriptor *memory, uint64_t size, uint32_t flags, uint32_t *handle)
++{
++	struct gpu_buffer *b = NULL;
++	uint64_t address;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (address = agm_mali_va_alloc(size, !(flags & PANFROST_BO_NOEXEC))) == 0) {
++		IOLog("AgmMaliGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
++		return NULL;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && agm_mali_map(address + offset, phys,
++		    (flags & PANFROST_BO_NOEXEC) ? AGM_MALI_MAP_NOEXEC : 0);
++	}
++	agm_mali_flush(address, size);
++	if (!mapped) {
++		agm_mali_unmap(address, size);
++		agm_mali_flush(address, size);
++		agm_mali_va_free(address, size);
++		IOLog("AgmMaliGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	bzero(b, sizeof(*b));
++	b->address = address;
++	b->size = size;
++	b->flags = flags;
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++IOReturn
++AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
++{
++	uint64_t size = round_page_64(r->size);
++	IOBufferMemoryDescriptor *memory;
++	struct gpu_buffer *b;
++	bool heap = (r->flags & PANFROST_BO_HEAP) != 0;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    (vm_size_t)size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("AgmMaliGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount,
++		    fBufferBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	bzero(memory->getBytesNoCopy(), (size_t)size);
++	sweet_dcache_flush((vm_offset_t)memory->getBytesNoCopy(), (unsigned)size);
++	IOLockLock(gLock);
++	b = newBuffer(memory, size, r->flags | (heap ? PANFROST_BO_NOEXEC : 0), &r->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		b->kernel = (uint8_t *)memory->getBytesNoCopy();
++		r->offset = b->address;
++	}
++	IOLockUnlock(gLock);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * An IOSurface's memory as a buffer (one plane of 32-bit pixels, rows 64-byte aligned).
++ * Its memory is ordinary cached memory: pushed out of the processors' caches at every
++ * submission that names it (submit()).
++ */
++IOReturn
++AgmMaliGPUUserClient::surfaceBuffer(struct agm_surface *r)
++{
++	SweetSurface *s = sweet_surface_copy(r->surface);
++	struct gpu_buffer *b = NULL;
++	IOMemoryDescriptor *memory;
++	uint64_t size;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->memory == NULL || s->kernelAddress() == 0 || s->bytesPerElement != 4 || s->planeCount > 1 ||
++	    (s->bytesPerRow & 63) != 0 || (s->wrapped && s->wrapDelta != 0)) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	size = round_page_64(s->allocSize);
++	if (size > s->memory->getLength()) {
++		size = s->memory->getLength() & ~(uint64_t)PAGE_MASK;
++	}
++	r->size = size;
++	r->offset = s->offset;
++	r->rowBytes = s->bytesPerRow;
++	r->width = s->width;
++	r->height = s->height;
++	r->pixelFormat = s->pixelFormat;
++	r->planes = s->planeCount;
++	if (r->handle == kAgmDescribe) {
++		r->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	memory = IOSubMemoryDescriptor::withSubRange(s->memory, 0, size, kIODirectionInOut);
++	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
++		OSSafeReleaseNULL(memory);
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gLock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			r->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		memory->release();
++		s->release();
++	} else if ((b = newBuffer(s->memory, size, PANFROST_BO_NOEXEC, &r->handle)) != NULL) {
++		b->memory = memory;
++		b->kernel = (uint8_t *)s->kernelAddress();
++		b->surface = s;
++	}
++	if (b != NULL) {
++		r->gpuAddress = b->address;
++	}
++	IOLockUnlock(gLock);
++	if (b == NULL) {
++		memory->release();
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AgmMaliGPUUserClient::submit(struct pan_submit *r)
++{
++	uint32_t *handles = NULL;
++	uint64_t seqno;
++
++	if (r->bo_handle_count > GPU_SUBMIT_BOS || r->jc == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (r->bo_handle_count != 0) {
++		handles = IONew(uint32_t, r->bo_handle_count);
++		if (handles == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (copyin((user_addr_t)r->bo_handles, handles, r->bo_handle_count * sizeof(uint32_t)) != 0) {
++			IODelete(handles, uint32_t, r->bo_handle_count);
++			return kIOReturnVMError;
++		}
++	}
++	IOLockLock(gLock);
++	/* surfaces are cached memory: what the processors wrote goes out to memory, what they hold goes */
++	for (uint32_t i = 0; i < r->bo_handle_count; i++) {
++		struct gpu_buffer *b = buffer(handles[i]);
++		if (b != NULL && b->surface != NULL) {
++			sweet_dcache_flush((vm_offset_t)b->kernel, (unsigned)b->size);
++		}
++	}
++	seqno = agm_mali_submit(r->jc, r->requirements);
++	for (uint32_t i = 0; seqno != 0 && i < r->bo_handle_count; i++) {
++		struct gpu_buffer *b = buffer(handles[i]);
++		if (b != NULL) {
++			b->seqno = seqno;
++			if (b->surface != NULL) {
++				b->surface->drawn = (uint32_t)seqno;
++			}
++		}
++	}
++	IOLockUnlock(gLock);
++	if (handles != NULL) {
++		IODelete(handles, uint32_t, r->bo_handle_count);
++	}
++	if (fSubmits++ < 4) {
++		IOLog("AgmMaliGPU: submission %llu: chain at %#llx, %u buffers, requirements %#x\n", seqno, r->jc,
++		    r->bo_handle_count, r->requirements);
++	}
++	r->out_sync = (uint32_t)seqno;
++	return seqno != 0 ? kIOReturnSuccess : kIOReturnBusy;
++}
++
++IOReturn
++AgmMaliGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	struct gpu_buffer *b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gLock);
++	b = buffer(type);
++	if (b != NULL && b->surface == NULL && !(b->flags & PANFROST_BO_HEAP)) {
++		b->memory->retain();
++		b->seen = true;
++		*memory = b->memory;
++		*options = kIOMapWriteCombineCache;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gLock);
++	return ret;
++}
++
++static uint64_t
++milliseconds(int64_t ns)
++{
++	if (ns < 0) {
++		return GPU_PATIENCE_MS;
++	}
++	uint64_t ms = (uint64_t)ns / NSEC_PER_MSEC;
++	return ms > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : ms;
++}
++
++IOReturn
++AgmMaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	union {
++		struct pan_submit submit;
++		struct pan_wait_bo waitBo;
++		struct pan_create_bo createBo;
++		struct pan_mmap_bo mmapBo;
++		struct pan_get_param param;
++		struct pan_get_bo_offset boOffset;
++		struct pan_madvise madvise;
++		struct drm_gem_close close;
++		struct agm_wait_seqno waitSeqno;
++		struct agm_surface surface;
++	} r;
++	size_t size = args->structureInputSize;
++	struct gpu_buffer *b;
++	uint64_t seqno;
++	IOReturn ret = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!agm_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	switch (selector) {
++	case kPanGetParam:
++		r.param.value = agm_mali_param(r.param.param);
++		ret = r.param.value != ~0ull ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kPanCreateBo:
++		ret = createBo(&r.createBo);
++		break;
++	case kPanMmapBo:
++		IOLockLock(gLock);
++		ret = buffer(r.mmapBo.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		r.mmapBo.offset = (uint64_t)r.mmapBo.handle << 32;      /* nobody maps by it here */
++		IOLockUnlock(gLock);
++		break;
++	case kPanGetBoOffset:
++		IOLockLock(gLock);
++		b = buffer(r.boOffset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		r.boOffset.offset = b != NULL ? b->address : 0;
++		IOLockUnlock(gLock);
++		break;
++	case kPanSubmit:
++		ret = submit(&r.submit);
++		break;
++	case kPanWaitBo:
++		IOLockLock(gLock);
++		b = buffer(r.waitBo.handle);
++		seqno = b != NULL ? b->seqno : 0;
++		IOLockUnlock(gLock);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else if (seqno != 0 && !agm_mali_wait(seqno, milliseconds(r.waitBo.timeout_ns))) {
++			ret = kIOReturnTimeout;
++		}
++		break;
++	case kAgmWaitSeqno:
++		if (r.waitSeqno.seqno != 0 && !agm_mali_wait(r.waitSeqno.seqno, milliseconds(r.waitSeqno.timeout_ns))) {
++			ret = kIOReturnTimeout;
++		}
++		break;
++	case kPanMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kPanSetLabelBo:
++	case kPanPerfcntEnable:
++	case kPanPerfcntDump:
++		ret = selector == kPanSetLabelBo ? kIOReturnSuccess : kIOReturnUnsupported;
++		break;
++	case kDrmGemClose:
++		IOLockLock(gLock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++		}
++		IOLockUnlock(gLock);
++		break;
++	case kAgmSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	default:
++		IOLog("AgmMaliGPU: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t)size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++#endif /* SWEET_AGM */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index c92beb026..87650b4da 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -25,6 +25,9 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/TopazAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
++iokit/Kernel/arm/AgmMali.cpp                                     optional iokitcpp
++iokit/Kernel/arm/AgmMaliGPU.cpp                                  optional iokitcpp
++iokit/Kernel/arm/AgmMaliGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

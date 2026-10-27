@@ -1,0 +1,1187 @@
+From 6436943ace6c67bd6c407516b555c957a55752ff Mon Sep 17 00:00:00 2001
+From: cunny <cunny@MacbookAirM1.lan>
+Date: Wed, 28 Oct 2026 00:09:37 +0300
+Subject: [PATCH] agm 0988 usb: MUSB device mode, CDC-ECM ue0 192.168.7.2, live
+ console log over UDP
+
+---
+ bsd/conf/files     |    1 +
+ bsd/dev/agm_keys.c |    4 +
+ bsd/dev/agm_usb.c  | 1131 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1136 insertions(+)
+ create mode 100644 bsd/dev/agm_usb.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index fcb092fd9..09a72efb6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/agm_keys.c			standard
+ bsd/dev/agm_dropbox.c			standard
+ bsd/dev/agm_wcn.c			standard
+ bsd/dev/agm_wcn_sipc.c			standard
++bsd/dev/agm_usb.c			standard
+ bsd/dev/agm_wifi.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index a13985a60..025498a30 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -46,6 +46,8 @@
+  * defaults (VOREG differs) the setup is applied again. REG0 STAT bits 5:4
+  * (0 ready, 1 charging, 2 done, 3 fault) feed SweetBattery.
+  *
++ * USB: boot-arg agm_usb=1 starts USB Ethernet (ue0) with the live console log (bsd/dev/agm_usb.c).
++ *
+  * Wi-Fi: boot-arg agm_wcn=1 starts the Marlin3 WCN (bsd/dev/agm_wcn.c) through agm_pmic_rd/wr and
+  * agm_gpio_out.
+  *
+@@ -864,6 +866,8 @@ agm_keys_init(void)
+ 	}
+ 	extern void agm_wcn_start(void);
+ 	agm_wcn_start();
++	extern void agm_usb_start(void);
++	agm_usb_start();
+ 	dmsk = 0;
+ 	if (PE_parse_boot_argn("agm_gpu", &dmsk, sizeof(dmsk)) && dmsk != 0) {
+ 		extern void AgmMaliGPUStart(void);
+diff --git a/bsd/dev/agm_usb.c b/bsd/dev/agm_usb.c
+new file mode 100644
+index 000000000..16d1c23a1
+--- /dev/null
++++ b/bsd/dev/agm_usb.c
+@@ -0,0 +1,1131 @@
++/*
++ * AGM H6 USB: device mode with a CDC-ECM (USB Ethernet) function, like topaz's sweet_usb.c (DWC3).
++ * Boot-arg agm_usb=1 starts it; agm_usblog=0 turns off the live console log.
++ *
++ * Hardware (live FDT, vendor Realme C53 kernel: drivers/usb/musb/musb_sprd.c, drivers/usb/phy/
++ * phy-sprd-qogirl6.c):
++ *   controller  Mentor MUSB "sprd,qogirl6-musb" @0x64900000 (flat endpoint registers at 0x100 + 0x10 * n,
++ *               FIFOs at 0x20 + 4 * n, dynamic FIFO RAM), IRQ SPI 69, dr-mode peripheral; core clock is
++ *               AON APB EB1 (0x04) bit 8 otg_utmi_eb
++ *   PHY         AON APB 0x64000000 (set/clear aliases +0x1000/+0x2000): CGM_REG1 0x138 bits 12/10 (otg/dphy
++ *               ref), RST1 0x10 bits 9/8 (PHY/UTMI soft reset), OTG_PHY_TEST 0x204 bit 24 (VBUS valid),
++ *               OTG_PHY_CTRL 0x208 bit 30 (UTMI width) / bit 3 (IDDIG = device); analog ANLG_PHY_G2
++ *               0x64570000: UTMI_CTL1 0x04, BATTER_PLL 0x08 (power down bits 4/3), UTMI_CTL2 0x0c (pull
++ *               downs), TRIMMING 0x10 (eye pattern, DT device 0x0613d1c0), ISO_SW 0x1c, REG_SEL_CFG_0 0x20
++ *   power       SC2730 LDO VDDUSB33 (pd 0x19e8 bit 0, vol 0x19ec, 1.2 V + 10 mV steps) at 3.3 V
++ *   USB/UART/JTAG pin mux: AON APB 0x374 bits 3:0, 0 = USB
++ *
++ * Polled from a kernel thread with PIO through the FIFOs (no interrupt, no DMA). VBUS is forced valid in
++ * the PHY, as the vendor PHY init does; without a cable nothing happens. Endpoints: 0x81 bulk IN = EP1 TX,
++ * 0x01 bulk OUT = EP1 RX, 0x82 interrupt IN = EP2 TX. The phone is 192.168.7.2 on ue0, the host
++ * 192.168.7.1 (ECM host MAC 02:00:5e:77:ee:01, as topaz: ios-topaz/tools/sweet-usbnet.sh works as is);
++ * the console log goes to the host as UDP to port 5140.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool agm_pmic_rd(uint32_t reg, uint32_t *val);
++extern bool agm_pmic_wr(uint32_t reg, uint32_t val);
++extern int (*PE_halt_restart)(unsigned int type);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++void agm_usb_start(void);
++
++#define AON_PA                  0x64000000
++#define AON_SIZE                0x3000
++#define AON_SET                 0x1000
++#define AON_CLR                 0x2000
++#define AON_EB1                 0x004
++#define   OTG_UTMI_EB           (1u << 8)
++#define AON_RST1                0x010
++#define   OTG_PHY_SOFT_RST      (1u << 9)
++#define   OTG_UTMI_SOFT_RST     (1u << 8)
++#define AON_CGM_REG1            0x138
++#define   CGM_OTG_REF_EN        (1u << 12)
++#define   CGM_DPHY_REF_EN       (1u << 10)
++#define AON_OTG_PHY_TEST        0x204
++#define   OTG_VBUS_VALID_PHYREG (1u << 24)
++#define AON_OTG_PHY_CTRL        0x208
++#define   UTMI_WIDTH_SEL        (1u << 30)
++#define   USB2_PHY_IDDIG        (1u << 3)
++#define AON_USB_MUX             0x374
++
++#define ANA_PA                  0x64570000
++#define ANA_SIZE                0x1000
++#define ANA_UTMI_CTL1           0x04
++#define   ANA_VBUSVLDEXT        (1u << 16)
++#define   ANA_DATABUS16_8       (1u << 28)
++#define ANA_BATTER_PLL          0x08
++#define   ANA_PS_PD             ((1u << 4) | (1u << 3))
++#define ANA_UTMI_CTL2           0x0c
++#define   ANA_PULLDOWNS         ((1u << 4) | (1u << 3))
++#define ANA_TRIMMING            0x10
++#define   DEVICE_EYE_PATTERN    0x0613d1c0
++#define ANA_ISO_SW              0x1c
++#define ANA_REG_SEL_CFG_0       0x20
++#define   ANA_SEL_PULLDOWNS     ((1u << 2) | (1u << 1))
++
++#define LDO_WR_PROT             0x1bd0
++#define LDO_WR_UNLOCK           0x6e7f
++#define LDO_VDDUSB33_PD         0x19e8
++#define LDO_VDDUSB33_VOL        0x19ec          /* 1200 mV + 10 mV steps, 8 bits */
++
++#define MUSB_PA                 0x64900000
++#define MUSB_SIZE               0x2000
++#define M_FADDR                 0x00            /* 8 */
++#define M_POWER                 0x01            /* 8 */
++#define   POWER_HSMODE          0x10
++#define   POWER_HSENAB          0x20
++#define   POWER_SOFTCONN        0x40
++#define M_INTRTX                0x02            /* 16, read clears */
++#define M_INTRRX                0x04
++#define M_INTRTXE               0x06
++#define M_INTRRXE               0x08
++#define M_INTRUSB               0x0a            /* 8, read clears */
++#define   IUSB_SUSPEND          0x01
++#define   IUSB_RESUME           0x02
++#define   IUSB_RESET            0x04
++#define   IUSB_DISCON           0x20
++#define M_INTRUSBE              0x0b
++#define M_INDEX                 0x0e
++#define M_TESTMODE              0x0f
++#define M_FIFO(n)               (0x20 + 4 * (n))
++#define M_DEVCTL                0x60
++#define M_TXFIFOSZ              0x62            /* indexed: log2(size) - 3, bit 4 double buffer */
++#define M_RXFIFOSZ              0x63
++#define M_TXFIFOADD             0x64            /* indexed: address / 8 */
++#define M_RXFIFOADD             0x66
++#define M_HWVERS                0x6c
++#define M_EPINFO                0x78
++#define M_RAMINFO               0x79
++#define M_RX_DPKTBUFDIS         0x340
++#define M_TX_DPKTBUFDIS         0x342
++#define M_EP(n)                 (0x100 + 0x10 * (n))
++#define M_TXMAXP                0x00
++#define M_TXCSR                 0x02            /* CSR0 for endpoint 0 */
++#define M_RXMAXP                0x04
++#define M_RXCSR                 0x06
++#define M_RXCOUNT               0x08            /* COUNT0 for endpoint 0 */
++#define M_CONFIGDATA            0x0f
++
++#define CSR0_RXPKTRDY           0x0001
++#define CSR0_TXPKTRDY           0x0002
++#define CSR0_SENTSTALL          0x0004
++#define CSR0_DATAEND            0x0008
++#define CSR0_SETUPEND           0x0010
++#define CSR0_SENDSTALL          0x0020
++#define CSR0_SVDRXPKTRDY        0x0040
++#define CSR0_SVDSETUPEND        0x0080
++#define CSR0_FLUSHFIFO          0x0100
++
++#define TXCSR_TXPKTRDY          0x0001
++#define TXCSR_FIFONOTEMPTY      0x0002
++#define TXCSR_FLUSHFIFO         0x0008
++#define TXCSR_SENTSTALL         0x0020
++#define TXCSR_CLRDATATOG        0x0040
++#define TXCSR_MODE              0x2000
++
++#define RXCSR_RXPKTRDY          0x0001
++#define RXCSR_FLUSHFIFO         0x0010
++#define RXCSR_SENTSTALL         0x0040
++#define RXCSR_CLRDATATOG        0x0080
++
++/*
++ * Unisoc USB DMA (vendor sprd_musbhsdma.c, CONFIG_USB_SPRD_DMA_V3). PIO reads of an OUT endpoint's FIFO
++ * return zeros on this controller (the vendor driver never does them), so bulk OUT goes through DMA
++ * channel ep + 15 with one 16-byte list node {addr, frag_len 32 | blk_len << 16, list_end | ioc |
++ * addr[35:32] << 8, 0}; the channel stops at the node's end or at a short packet, CHN_LEN[31:16] then
++ * holds the bytes not filled. Bulk IN stays PIO.
++ */
++#define DMA_FRAG_WAIT           0x1004
++#define DMA_CHN_PAUSE(n)        (0x1c00 + ((n) - 1) * 0x20)
++#define DMA_CHN_CFG(n)          (0x1c04 + ((n) - 1) * 0x20)
++#define   CHN_EN                (1u << 0)
++#define DMA_CHN_INTR(n)         (0x1c08 + ((n) - 1) * 0x20)
++#define   CHN_LLIST_INT_EN      (1u << 2)
++#define   CHN_USBRX_INT_EN      (1u << 4)
++#define   CHN_CLEAR_INT_EN      (1u << 5)
++#define   CHN_LLIST_INT_STS     (1u << 18)
++#define   CHN_INT_CLR_ALL       (0x1fu << 24)
++#define DMA_CHN_LEN(n)          (0x1c10 + ((n) - 1) * 0x20)
++#define DMA_CHN_LLIST_PTR(n)    (0x1c14 + ((n) - 1) * 0x20)
++#define DMA_CHN_ADDR_H(n)       (0x1c18 + ((n) - 1) * 0x20)
++#define RX_CHN                  (EP_DATA + 15)
++#define RXCSR_DMA_SETTING       0xa800          /* AUTOCLEAR | DMAENAB | DMAMODE */
++#define RXD_NODE                0x0000
++#define RXD_BUF                 0x1000
++#define RXD_SIZE                0x4000
++
++#define EP_DATA                 1               /* bulk IN (TX) and OUT (RX) */
++#define EP_NOTIFY               2               /* interrupt IN */
++#define EP0_MAXP                64
++#define FRAME_MAX               2048
++#define TXQ                     256
++
++static struct {
++	vm_offset_t aon, ana, musb;
++	int         sleep_chan;
++	enum { EP0_IDLE, EP0_IN, EP0_OUT, EP0_STATUS } ep0;
++	uint8_t     ep0_buf[256];
++	uint32_t    ep0_off, ep0_left, ep0_out_left;
++	bool        ep0_zlp;
++	int         pending_addr;           /* -1: none */
++	bool        configured, hs, notify_pending;
++	uint8_t     data_alt;
++	uint16_t    maxp;
++	/* RX: one frame assembled from bulk OUT packets */
++	uint8_t     rx_buf[FRAME_MAX];
++	uint32_t    rx_len;
++	bool        rx_overflow;
++	/* TX: frame being sent, queue filled by ue0's output */
++	uint8_t     tx_buf[FRAME_MAX];
++	uint32_t    tx_len, tx_off;
++	lck_mtx_t  *lock;
++	mbuf_t      txq[TXQ];
++	unsigned    txq_head, txq_count;
++	ifnet_t     ifp;
++	vm_offset_t rxd;                /* DMA area: list node + one frame */
++	uint64_t    rxd_pa;
++	bool        rx_armed;
++	uint64_t    rx_frames, tx_frames, rx_drops, resets;
++	uint64_t    tx_qdrops;            /* ue0 output dropped: queue full */
++	uint64_t    rx_pkts;              /* bulk OUT packets read */
++	uint16_t    intrrx_seen;          /* INTRRX bits seen since the last report */
++} ub = { .pending_addr = -1 };
++
++static inline uint8_t  m_rd8(uint32_t o) { return *(volatile uint8_t *)(ub.musb + o); }
++static inline uint16_t m_rd16(uint32_t o) { return *(volatile uint16_t *)(ub.musb + o); }
++static inline uint32_t m_rd32(uint32_t o) { return *(volatile uint32_t *)(ub.musb + o); }
++static inline void m_wr8(uint32_t o, uint8_t v) { *(volatile uint8_t *)(ub.musb + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++static inline void m_wr16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(ub.musb + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++static inline void m_wr32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(ub.musb + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++
++static inline uint32_t
++rd32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* AON APB bits through the set/clear aliases (the GPU and WCN code change other bits of these registers) */
++static void aon_set(uint32_t off, uint32_t bits) { wr32(ub.aon + AON_SET + off, bits); }
++static void aon_clr(uint32_t off, uint32_t bits) { wr32(ub.aon + AON_CLR + off, bits); }
++
++/* Analog PHY registers: only this driver touches them */
++static void
++ana_upd(uint32_t off, uint32_t mask, uint32_t val)
++{
++	wr32(ub.ana + off, (rd32(ub.ana + off) & ~mask) | (val & mask));
++}
++
++static void
++ub_sleep_us(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&ub.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- FIFOs (32-bit accesses, bytes for the tail) ---- */
++
++/*
++ * The endpoint is also selected in INDEX, as Linux musb does before each FIFO access: with INDEX 0 an
++ * EP1 RX FIFO read returned zeros (right count, writes and ep0 were fine).
++ */
++static void
++fifo_read(unsigned ep, uint8_t *dst, uint32_t len)
++{
++	uint32_t i = 0;
++	m_wr8(M_INDEX, (uint8_t)ep);
++	for (; i + 4 <= len; i += 4) {
++		uint32_t w = m_rd32(M_FIFO(ep));
++		memcpy(dst + i, &w, 4);
++	}
++	for (; i < len; i++) {
++		dst[i] = m_rd8(M_FIFO(ep));
++	}
++	m_wr8(M_INDEX, 0);
++}
++
++static void
++fifo_write(unsigned ep, const uint8_t *src, uint32_t len)
++{
++	uint32_t i = 0;
++	m_wr8(M_INDEX, (uint8_t)ep);
++	for (; i + 4 <= len; i += 4) {
++		uint32_t w;
++		memcpy(&w, src + i, 4);
++		*(volatile uint32_t *)(ub.musb + M_FIFO(ep)) = w;
++	}
++	for (; i < len; i++) {
++		*(volatile uint8_t *)(ub.musb + M_FIFO(ep)) = src[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	m_wr8(M_INDEX, 0);
++}
++
++/* ---- descriptors (CDC-ECM, as topaz; VID 0x1209 / PID 0x0001 = pid.codes test ID) ---- */
++
++static const uint8_t ub_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, EP0_MAXP,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ub_qual_desc[10] = { 10, 6, 0x00, 0x02, 0x02, 0x00, 0x00, EP0_MAXP, 1, 0 };
++#define CFG_EP81_MAXP           64              /* offsets of the bulk wMaxPacketSize fields */
++#define CFG_EP01_MAXP           71
++static const uint8_t ub_cfg_desc[80] = {
++	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 (64 at full speed) */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT */
++};
++static const char *const ub_strings[] = {
++	NULL, "ios-agm", "AGM H6 iOS (USB Ethernet)", "0001", "02005E77EE01",
++};
++static const uint8_t ub_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++
++static uint32_t
++ub_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ub_strings) / sizeof(ub_strings[0])) {
++		return 0;
++	}
++	const char *str = ub_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++/* ---- endpoints ---- */
++
++/* FIFO RAM: ep0 64 bytes at 0, EP1 TX/RX 2 x 512 each, EP2 TX 64 */
++static void
++ub_fifo_setup(void)
++{
++	m_wr8(M_INDEX, EP_DATA);
++	m_wr8(M_TXFIFOSZ, 6);           /* single buffered: PIO into a double-buffered IN FIFO corrupted data */
++	m_wr16(M_TXFIFOADD, 64 / 8);
++	m_wr8(M_RXFIFOSZ, 0x10 | 6);
++	m_wr16(M_RXFIFOADD, (64 + 1024) / 8);
++	m_wr8(M_INDEX, EP_NOTIFY);
++	m_wr8(M_TXFIFOSZ, 3);
++	m_wr16(M_TXFIFOADD, (64 + 2048) / 8);
++	m_wr8(M_INDEX, 0);
++	m_wr16(M_TX_DPKTBUFDIS, m_rd16(M_TX_DPKTBUFDIS) | (1u << EP_DATA));
++	m_wr16(M_RX_DPKTBUFDIS, m_rd16(M_RX_DPKTBUFDIS) & ~(1u << EP_DATA));
++}
++
++/* Bulk OUT DMA: stop the channel; arm it for one frame into RXD_BUF */
++static void
++ub_rx_dma_stop(void)
++{
++	m_wr32(DMA_CHN_CFG(RX_CHN), 0);
++	m_wr32(DMA_CHN_PAUSE(RX_CHN), 0);
++	m_wr32(DMA_CHN_INTR(RX_CHN), m_rd32(DMA_CHN_INTR(RX_CHN)) | CHN_INT_CLR_ALL);
++	ub.rx_armed = false;
++}
++
++static void
++ub_rx_dma_arm(void)
++{
++	volatile uint32_t *node = (volatile uint32_t *)(ub.rxd + RXD_NODE);
++	uint64_t buf = ub.rxd_pa + RXD_BUF, npa = ub.rxd_pa + RXD_NODE;
++
++	node[0] = (uint32_t)buf;
++	node[1] = 32u | ((uint32_t)FRAME_MAX << 16);
++	node[2] = (1u << 0) | (1u << 2) | ((uint32_t)((buf >> 32) & 0xf) << 8);
++	node[3] = 0;
++	flush_dcache64((addr64_t)npa, 16, TRUE);
++	flush_dcache64((addr64_t)buf, FRAME_MAX, TRUE);
++	m_wr32(DMA_FRAG_WAIT, 8);
++	m_wr32(DMA_CHN_INTR(RX_CHN), (m_rd32(DMA_CHN_INTR(RX_CHN)) & 0xffff) | CHN_USBRX_INT_EN | CHN_LLIST_INT_EN |
++	    CHN_CLEAR_INT_EN | CHN_INT_CLR_ALL);
++	m_wr32(DMA_CHN_LLIST_PTR(RX_CHN), (uint32_t)npa);
++	m_wr32(DMA_CHN_ADDR_H(RX_CHN), (uint32_t)(npa >> 32) << 4);
++	m_wr32(DMA_CHN_CFG(RX_CHN), m_rd32(DMA_CHN_CFG(RX_CHN)) | CHN_EN);
++	ub.rx_armed = true;
++}
++
++/* Data endpoints after a bus reset or a (re)configuration: max packet, empty FIFOs, DATA0 */
++static void
++ub_data_eps_reset(void)
++{
++	ub.maxp = ub.hs ? 512 : 64;
++	m_wr16(M_EP(EP_DATA) + M_TXMAXP, ub.maxp);
++	m_wr16(M_EP(EP_DATA) + M_RXMAXP, ub.maxp);
++	m_wr16(M_EP(EP_NOTIFY) + M_TXMAXP, 16);
++	for (unsigned ep = EP_DATA; ep <= EP_NOTIFY; ep++) {
++		/* twice: a double-buffered FIFO may hold two packets */
++		for (int i = 0; i < 2; i++) {
++			if (m_rd16(M_EP(ep) + M_TXCSR) & TXCSR_FIFONOTEMPTY) {
++				m_wr16(M_EP(ep) + M_TXCSR, TXCSR_MODE | TXCSR_FLUSHFIFO);
++			}
++		}
++		m_wr16(M_EP(ep) + M_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
++	}
++	for (int i = 0; i < 2; i++) {
++		if (m_rd16(M_EP(EP_DATA) + M_RXCSR) & RXCSR_RXPKTRDY) {
++			m_wr16(M_EP(EP_DATA) + M_RXCSR, RXCSR_FLUSHFIFO);
++		}
++	}
++	ub_rx_dma_stop();
++	m_wr16(M_EP(EP_DATA) + M_RXCSR, RXCSR_CLRDATATOG);
++	m_wr16(M_EP(EP_DATA) + M_RXCSR, RXCSR_DMA_SETTING);
++	if (ub.configured) {
++		ub_rx_dma_arm();
++	}
++	ub.rx_len = 0;
++	ub.rx_overflow = false;
++	ub.tx_len = ub.tx_off = 0;
++}
++
++/* NETWORK_CONNECTION (connected) on 0x82: the host brings its link up on it */
++static void
++ub_notify(void)
++{
++	static const uint8_t n[8] = { 0xa1, 0x00, 1, 0, 0, 0, 0, 0 };
++	if (m_rd16(M_EP(EP_NOTIFY) + M_TXCSR) & TXCSR_TXPKTRDY) {
++		return;
++	}
++	fifo_write(EP_NOTIFY, n, sizeof(n));
++	m_wr16(M_EP(EP_NOTIFY) + M_TXCSR, TXCSR_MODE | TXCSR_TXPKTRDY);
++	ub.notify_pending = false;
++}
++
++/* ---- endpoint 0 ---- */
++
++static void
++ep0_in_next(void)
++{
++	uint32_t n = MIN(ub.ep0_left, (uint32_t)EP0_MAXP);
++	fifo_write(0, ub.ep0_buf + ub.ep0_off, n);
++	ub.ep0_off += n;
++	ub.ep0_left -= n;
++	/* a reply shorter than wLength that ends on a full packet needs a zero-length packet */
++	bool last = ub.ep0_left == 0 && (n < EP0_MAXP || !ub.ep0_zlp);
++	m_wr16(M_EP(0) + M_TXCSR, CSR0_TXPKTRDY | (last ? CSR0_DATAEND : 0));
++	ub.ep0 = last ? EP0_STATUS : EP0_IN;
++}
++
++static void
++ub_setup(const uint8_t *st)
++{
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint8_t *data = ub.ep0_buf;
++	uint32_t n = 0;
++	bool ok = true;
++
++	printf("AGM USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	if ((type & 0x60) == 0x20) {            /* class: SET_ETHERNET_PACKET_FILTER etc., data ignored */
++		ok = !(type & 0x80);
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == 6) {                  /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: memcpy(data, ub_dev_desc, sizeof(ub_dev_desc)); n = sizeof(ub_dev_desc); break;
++		case 2:
++			memcpy(data, ub_cfg_desc, sizeof(ub_cfg_desc));
++			n = sizeof(ub_cfg_desc);
++			if (!ub.hs) {
++				data[CFG_EP81_MAXP] = data[CFG_EP01_MAXP] = 64;
++				data[CFG_EP81_MAXP + 1] = data[CFG_EP01_MAXP + 1] = 0;
++			}
++			break;
++		case 3: n = ub_string(value & 0xff, data); ok = n != 0; break;
++		case 6: memcpy(data, ub_qual_desc, sizeof(ub_qual_desc)); n = sizeof(ub_qual_desc); break;
++		default: ok = false; break;
++		}
++	} else if (req == 5) {                  /* SET_ADDRESS: FADDR after the status stage */
++		ub.pending_addr = value & 0x7f;
++	} else if (req == 9) {                  /* SET_CONFIGURATION */
++		ub.configured = value == 1;
++		ub.data_alt = 0;
++		ub_data_eps_reset();
++		printf("AGM USB: configuration %u (%s speed, max packet %u)\n", value, ub.hs ? "high" : "full", ub.maxp);
++	} else if (req == 8) {                  /* GET_CONFIGURATION */
++		data[0] = ub.configured ? 1 : 0; n = 1;
++	} else if (req == 0) {                  /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 11) {                 /* SET_INTERFACE */
++		if (index == 1) {
++			ub.data_alt = (uint8_t)value;
++			ub_data_eps_reset();
++			ub.notify_pending = value == 1 && ub.configured;
++		}
++	} else if (req == 10) {                 /* GET_INTERFACE */
++		data[0] = index == 1 ? ub.data_alt : 0; n = 1;
++	} else if (req == 1 || req == 3) {      /* CLEAR/SET_FEATURE */
++		if (req == 1 && (type & 0x1f) == 2 && value == 0) {     /* ENDPOINT_HALT: back to DATA0 */
++			if (index == 0x81) {
++				m_wr16(M_EP(EP_DATA) + M_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
++			} else if (index == 0x01) {
++				m_wr16(M_EP(EP_DATA) + M_RXCSR, RXCSR_CLRDATATOG);
++			}
++		}
++	} else {
++		ok = false;
++	}
++
++	if (!ok) {
++		m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY | CSR0_SENDSTALL);
++		ub.ep0 = EP0_IDLE;
++		return;
++	}
++	if (length == 0) {
++		m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY | CSR0_DATAEND);
++		ub.ep0 = EP0_STATUS;
++		return;
++	}
++	m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY);
++	for (int i = 0; i < 1000 && (m_rd16(M_EP(0) + M_TXCSR) & CSR0_RXPKTRDY); i++) {
++		delay(1);
++	}
++	if (type & 0x80) {
++		ub.ep0_off = 0;
++		ub.ep0_left = MIN(n, (uint32_t)length);
++		ub.ep0_zlp = ub.ep0_left < length;
++		ep0_in_next();
++	} else {
++		ub.ep0_out_left = length;
++		ub.ep0 = EP0_OUT;
++	}
++}
++
++static void
++ub_ep0(void)
++{
++	uint16_t csr = m_rd16(M_EP(0) + M_TXCSR);
++
++	if (csr & CSR0_SENTSTALL) {
++		m_wr16(M_EP(0) + M_TXCSR, csr & ~CSR0_SENTSTALL);
++		ub.ep0 = EP0_IDLE;
++		csr = m_rd16(M_EP(0) + M_TXCSR);
++	}
++	if (csr & CSR0_SETUPEND) {
++		m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDSETUPEND);
++		ub.ep0 = EP0_IDLE;
++		csr = m_rd16(M_EP(0) + M_TXCSR);
++	}
++	if (ub.ep0 == EP0_STATUS) {             /* this interrupt is the status stage completing */
++		if (ub.pending_addr >= 0) {
++			m_wr8(M_FADDR, (uint8_t)ub.pending_addr);
++			printf("AGM USB: address %d\n", ub.pending_addr);
++			ub.pending_addr = -1;
++		}
++		ub.ep0 = EP0_IDLE;
++	}
++	if (ub.ep0 == EP0_IN && !(csr & CSR0_TXPKTRDY)) {
++		ep0_in_next();
++		return;
++	}
++	if (!(csr & CSR0_RXPKTRDY)) {
++		return;
++	}
++	uint32_t count = m_rd16(M_EP(0) + M_RXCOUNT) & 0x7f;
++	if (ub.ep0 == EP0_OUT) {                /* OUT data stage of a class request: read and drop */
++		uint8_t tmp[EP0_MAXP];
++		fifo_read(0, tmp, MIN(count, (uint32_t)EP0_MAXP));
++		ub.ep0_out_left = count >= ub.ep0_out_left ? 0 : ub.ep0_out_left - count;
++		if (ub.ep0_out_left == 0 || count < EP0_MAXP) {
++			m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY | CSR0_DATAEND);
++			ub.ep0 = EP0_STATUS;
++		} else {
++			m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY);
++		}
++		return;
++	}
++	uint8_t st[8];
++	if (count != 8) {
++		printf("AGM USB: setup packet of %u bytes\n", count);
++		fifo_read(0, ub.ep0_buf, MIN(count, (uint32_t)sizeof(ub.ep0_buf)));
++		m_wr16(M_EP(0) + M_TXCSR, CSR0_SVDRXPKTRDY | CSR0_SENDSTALL);
++		return;
++	}
++	fifo_read(0, st, 8);
++	ub_setup(st);
++}
++
++/* ---- data: bulk OUT -> ue0 input ---- */
++
++/* The first frames each way in hex (64 bytes), to check what crosses the bus */
++static void
++ub_hexdump(const char *dir, uint64_t nr, const uint8_t *p, uint32_t len)
++{
++	static const char hx[] = "0123456789abcdef";
++	char line[64 * 2 + 1];
++	uint32_t n = MIN(len, 64u);
++
++	for (uint32_t i = 0; i < n; i++) {
++		line[2 * i] = hx[p[i] >> 4];
++		line[2 * i + 1] = hx[p[i] & 15];
++	}
++	line[2 * n] = 0;
++	printf("AGM USB: %s frame %llu len %u: %s\n", dir, nr, len, line);
++}
++
++static void
++ub_rx_frame(void)
++{
++	uint32_t len = ub.rx_len;
++
++	if (ub.ifp == NULL || ub.rx_overflow || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
++		ub.rx_drops++;
++		return;
++	}
++	/*
++	 * Remote restart for the test loop: UDP "reboot" to 192.168.7.2:5141 (on the PC:
++	 * echo reboot | socat - UDP:192.168.7.2:5141). The bootloader then falls back to slot A.
++	 */
++	const uint8_t *f = ub.rx_buf;
++	if (len >= 14 + 20 + 8 + 6 && f[12] == 0x08 && f[13] == 0x00 && (f[14] >> 4) == 4 && f[23] == 17) {
++		const uint8_t *udp = f + 14 + (f[14] & 15) * 4;
++		if (udp + 8 + 6 <= f + len && udp[2] == 0x14 && udp[3] == 0x15 && memcmp(udp + 8, "reboot", 6) == 0) {
++			printf("AGM USB: reboot requested over USB\n");
++			(void)PE_halt_restart(1);     /* kPERestartCPU */
++		}
++	}
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		struct ifnet_stat_increment_param stats = {};
++		memcpy(mbuf_data(m), ub.rx_buf, len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, ub.ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		stats.packets_in = 1;
++		stats.bytes_in = len;
++		if (ub.rx_frames < 6) {
++			ub_hexdump("rx", ub.rx_frames, ub.rx_buf, len);
++		}
++		ub.rx_frames++;
++		ifnet_input(ub.ifp, m, &stats);
++	} else {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		ub.rx_drops++;
++	}
++}
++
++/* Returns true if a packet was taken. A short packet (< max packet, also zero length) ends a frame. */
++static bool
++ub_rx(void)
++{
++	if (!ub.rx_armed) {
++		ub_rx_dma_arm();
++		return false;
++	}
++	uint32_t intr = m_rd32(DMA_CHN_INTR(RX_CHN));
++	if (!(intr & CHN_LLIST_INT_STS)) {
++		return false;
++	}
++	uint32_t left = m_rd32(DMA_CHN_LEN(RX_CHN)) >> 16;
++	uint32_t len = left <= FRAME_MAX ? FRAME_MAX - left : 0;
++	m_wr32(DMA_CHN_INTR(RX_CHN), intr | CHN_INT_CLR_ALL);
++	flush_dcache64((addr64_t)(ub.rxd_pa + RXD_BUF), FRAME_MAX, TRUE);
++	if (ub.rx_pkts++ < 8) {
++		printf("AGM USB: rx dma done: intr %#x len %u (left %u) cfg %#x rxcsr %#x\n", intr, len, left,
++		    m_rd32(DMA_CHN_CFG(RX_CHN)), m_rd16(M_EP(EP_DATA) + M_RXCSR));
++	}
++	memcpy(ub.rx_buf, (const void *)(ub.rxd + RXD_BUF), len);
++	ub.rx_len = len;
++	ub.rx_overflow = false;
++	ub_rx_frame();
++	ub.rx_len = 0;
++	ub_rx_dma_arm();
++	return true;
++}
++
++/* ---- data: ue0 output -> bulk IN ---- */
++
++/* Returns true if a packet was loaded. */
++static bool
++ub_tx(void)
++{
++	if (ub.tx_off >= ub.tx_len) {
++		mbuf_t m = NULL;
++		lck_mtx_lock(ub.lock);
++		if (ub.txq_count > 0) {
++			m = ub.txq[ub.txq_head];
++			ub.txq_head = (ub.txq_head + 1) % TXQ;
++			ub.txq_count--;
++		}
++		lck_mtx_unlock(ub.lock);
++		if (m == NULL) {
++			return false;
++		}
++		size_t len = mbuf_pkthdr_len(m);
++		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN || !ub.configured || ub.data_alt != 1) {
++			mbuf_freem(m);
++			return true;
++		}
++		mbuf_copydata(m, 0, len, ub.tx_buf);
++		mbuf_freem(m);
++		/* a frame of whole packets would need a zero-length packet to end it; a pad byte does the same */
++		if ((len % ub.maxp) == 0) {
++			ub.tx_buf[len++] = 0;
++		}
++		ub.tx_len = (uint32_t)len;
++		ub.tx_off = 0;
++		if (ub.tx_frames < 6) {
++			ub_hexdump("tx", ub.tx_frames, ub.tx_buf, ub.tx_len);
++		}
++		ub.tx_frames++;
++	}
++	uint16_t csr = m_rd16(M_EP(EP_DATA) + M_TXCSR);
++	if (csr & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY)) {
++		return false;
++	}
++	uint32_t n = MIN(ub.tx_len - ub.tx_off, (uint32_t)ub.maxp);
++	fifo_write(EP_DATA, ub.tx_buf + ub.tx_off, n);
++	m_wr16(M_EP(EP_DATA) + M_TXCSR, TXCSR_MODE | TXCSR_TXPKTRDY);
++	ub.tx_off += n;
++	return true;
++}
++
++static errno_t
++ub_if_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(ub.lock);
++	if (ub.txq_count == TXQ || !ub.configured) {
++		ub.tx_qdrops++;
++		lck_mtx_unlock(ub.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	ub.txq[(ub.txq_head + ub.txq_count) % TXQ] = m;
++	ub.txq_count++;
++	lck_mtx_unlock(ub.lock);
++	thread_wakeup(&ub.sleep_chan);
++	return 0;
++}
++
++static errno_t
++ub_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ub_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* ue0, 192.168.7.2/24 (the host side is 192.168.7.1) */
++static void
++ub_if_create(void)
++{
++	struct ifnet_init_eparams init;
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "agm-usb-ecm";
++	init.uniqueid_len = sizeof("agm-usb-ecm") - 1;
++	init.name = "ue";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ub_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ub_if_ioctl;
++	init.detach = ub_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ub.ifp) != 0) {
++		printf("AGM USB: ifnet_allocate failed\n");
++		ub.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ub.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ub.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ub.ifp, ETHERMTU);
++	ifnet_set_baudrate(ub.ifp, 480000000);
++	ifnet_set_flags(ub.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ub.ifp, NULL) != 0) {
++		printf("AGM USB: ifnet_attach failed\n");
++		ub.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ub.ifp, ub_phone_mac, ETHER_ADDR_LEN);
++
++	errno_t err = proto_plumb(PF_INET, ub.ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(ub.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	printf("AGM USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++}
++
++/* ---- bring-up ---- */
++
++static void
++ub_ldo_on(void)
++{
++	uint32_t p0 = 0, v0 = 0, p1 = 0, v1 = 0;
++
++	(void)agm_pmic_rd(LDO_VDDUSB33_PD, &p0);
++	(void)agm_pmic_rd(LDO_VDDUSB33_VOL, &v0);
++	(void)agm_pmic_wr(LDO_WR_PROT, LDO_WR_UNLOCK);
++	(void)agm_pmic_wr(LDO_VDDUSB33_VOL, (v0 & ~0xffu) | 210);    /* 3.3 V */
++	(void)agm_pmic_wr(LDO_VDDUSB33_PD, p0 & ~1u);
++	ub_sleep_us(1000);
++	(void)agm_pmic_rd(LDO_VDDUSB33_PD, &p1);
++	(void)agm_pmic_rd(LDO_VDDUSB33_VOL, &v1);
++	printf("AGM USB: LDO vddusb33 pd %#x -> %#x, vol %#x -> %#x\n", p0, p1, v0, v1);
++}
++
++static void
++ub_dump(const char *when)
++{
++	printf("AGM USB: %s: aon eb1 %#x rst1 %#x cgm1 %#x phy_test %#x phy_ctrl %#x mux %#x; "
++	    "ana ctl1 %#x pll %#x ctl2 %#x trim %#x iso %#x sel %#x\n", when,
++	    rd32(ub.aon + AON_EB1), rd32(ub.aon + AON_RST1), rd32(ub.aon + AON_CGM_REG1),
++	    rd32(ub.aon + AON_OTG_PHY_TEST), rd32(ub.aon + AON_OTG_PHY_CTRL), rd32(ub.aon + AON_USB_MUX),
++	    rd32(ub.ana + ANA_UTMI_CTL1), rd32(ub.ana + ANA_BATTER_PLL), rd32(ub.ana + ANA_UTMI_CTL2),
++	    rd32(ub.ana + ANA_TRIMMING), rd32(ub.ana + ANA_ISO_SW), rd32(ub.ana + ANA_REG_SEL_CFG_0));
++}
++
++/* sprd_hsphy_init() + sprd_hostphy_set(off) of the vendor PHY driver */
++static void
++ub_phy_init(void)
++{
++	ub_dump("before");
++	ub_ldo_on();
++	aon_set(AON_EB1, OTG_UTMI_EB);
++	aon_set(AON_CGM_REG1, CGM_OTG_REF_EN | CGM_DPHY_REF_EN);
++	ana_upd(ANA_ISO_SW, 1, 0);
++	ana_upd(ANA_BATTER_PLL, ANA_PS_PD, 0);
++	aon_set(AON_OTG_PHY_TEST, OTG_VBUS_VALID_PHYREG);
++	ana_upd(ANA_UTMI_CTL1, ANA_VBUSVLDEXT, ANA_VBUSVLDEXT);
++	aon_set(AON_OTG_PHY_CTRL, UTMI_WIDTH_SEL);
++	ana_upd(ANA_UTMI_CTL1, ANA_DATABUS16_8, ANA_DATABUS16_8);
++	wr32(ub.ana + ANA_TRIMMING, DEVICE_EYE_PATTERN);
++	aon_set(AON_RST1, OTG_PHY_SOFT_RST | OTG_UTMI_SOFT_RST);
++	ub_sleep_us(25000);
++	aon_clr(AON_RST1, OTG_PHY_SOFT_RST | OTG_UTMI_SOFT_RST);
++	/* device mode */
++	aon_set(AON_OTG_PHY_CTRL, USB2_PHY_IDDIG);
++	ana_upd(ANA_REG_SEL_CFG_0, ANA_SEL_PULLDOWNS, ANA_SEL_PULLDOWNS);
++	ana_upd(ANA_UTMI_CTL2, ANA_PULLDOWNS, 0);
++	ana_upd(ANA_UTMI_CTL1, 0xffff, 0);
++	if (rd32(ub.aon + AON_USB_MUX) & 0xf) {
++		aon_clr(AON_USB_MUX, 0xf);              /* pins to USB, not UART/JTAG */
++	}
++	ub_sleep_us(1000);
++	ub_dump("after");
++}
++
++static void
++ub_bus_reset(void)
++{
++	ub.hs = (m_rd8(M_POWER) & POWER_HSMODE) != 0;
++	ub.configured = false;
++	ub.data_alt = 0;
++	ub.ep0 = EP0_IDLE;
++	ub.pending_addr = -1;
++	ub.notify_pending = false;
++	ub.resets++;
++	m_wr8(M_FADDR, 0);
++	ub_fifo_setup();
++	ub_data_eps_reset();
++	printf("AGM USB: bus reset (%s speed), devctl %#x\n", ub.hs ? "high" : "full", m_rd8(M_DEVCTL));
++}
++
++static void
++ub_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t last_report = mach_absolute_time(), interval;
++
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &interval);
++	for (;;) {
++		bool busy = false;
++		uint8_t usb = m_rd8(M_INTRUSB);
++		uint16_t tx = m_rd16(M_INTRTX);
++		ub.intrrx_seen |= m_rd16(M_INTRRX);
++
++		if (usb & IUSB_RESET) {
++			ub_bus_reset();
++		}
++		if (usb & IUSB_DISCON) {
++			ub.configured = false;
++			printf("AGM USB: disconnect\n");
++		}
++		if ((usb & IUSB_SUSPEND) && ub.configured) {
++			printf("AGM USB: suspend\n");
++		}
++		if (tx & 1) {
++			ub_ep0();
++			busy = true;
++		}
++		if (ub.configured) {
++			for (int i = 0; i < 8 && ub_rx(); i++) {
++				busy = true;
++			}
++			if (ub.data_alt == 1) {
++				if (ub.notify_pending) {
++					ub_notify();
++				}
++				/*
++				 * Keep the IN FIFO fed while there is something to send: a 512-byte packet leaves
++				 * in ~10 us, much less than a sleep, so wait for TXPKTRDY by spinning.
++				 */
++				for (int i = 0, spins = 0; i < 256; i++) {
++					if (ub_tx()) {
++						busy = true;
++						spins = 0;
++					} else if (ub.tx_off < ub.tx_len && spins++ < 100) {
++						delay(1);
++					} else {
++						break;
++					}
++				}
++			}
++		}
++		if (mach_absolute_time() - last_report > interval) {
++			last_report = mach_absolute_time();
++			printf("AGM USB: ue0 rx %llu frames (%llu packets) tx %llu frames, %llu dropped, %llu resets, "
++			    "txq drops %llu, power %#x devctl %#x intrrx %#x rxcsr %#x rxmaxp %u txcsr %#x cfg %d alt %u\n",
++			    ub.rx_frames, ub.rx_pkts, ub.tx_frames, ub.rx_drops, ub.resets, ub.tx_qdrops, m_rd8(M_POWER), m_rd8(M_DEVCTL),
++			    ub.intrrx_seen, m_rd16(M_EP(EP_DATA) + M_RXCSR), m_rd16(M_EP(EP_DATA) + M_RXMAXP),
++			    m_rd16(M_EP(EP_DATA) + M_TXCSR), ub.configured, ub.data_alt);
++			ub.intrrx_seen = 0;
++		}
++		ub_sleep_us(busy ? 50 : 500);
++	}
++}
++
++/*
++ * Live console log over USB Ethernet (as topaz 0077): every 100 ms the new bytes of the console ring
++ * (bsd/dev/sweet_ufs.c) go as UDP datagrams to 192.168.7.255:5140 (broadcast: no ARP needed, so the log
++ * also gets out when nothing reaches the phone; on the PC: socat -u UDP-RECV:5140 -), starting
++ * with the last 64 KiB so the boot is included. Nothing here may print (it would feed itself).
++ */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
++
++static void
++ub_log_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char chunk[1400];
++	socket_t so = NULL;
++	struct sockaddr_in to;
++	uint64_t pos = sweet_log_position();
++	int log_chan;
++
++	pos = pos > 65536 ? pos - 65536 : 0;
++	bzero(&to, sizeof(to));
++	to.sin_len = sizeof(to);
++	to.sin_family = AF_INET;
++	to.sin_port = htons(5140);
++	to.sin_addr.s_addr = htonl(0xc0a807ff);         /* 192.168.7.255 */
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&log_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		if (!ub.configured || ub.data_alt != 1) {
++			continue;
++		}
++		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
++			so = NULL;
++			continue;
++		}
++		int on = 1;
++		(void)sock_setsockopt(so, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
++		uint32_t n;
++		uint64_t keep = pos;
++		/* the log gives way to other traffic: at most a quarter of the TX queue */
++		while (ub.txq_count < TXQ / 4 && (n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++			struct iovec iov = { .iov_base = chunk, .iov_len = n };
++			struct msghdr msg = {
++				.msg_name = &to, .msg_namelen = sizeof(to),
++				.msg_iov = &iov, .msg_iovlen = 1,
++			};
++			size_t sent = 0;
++			if (sock_send(so, &msg, 0, &sent) != 0) {
++				pos = keep;     /* no route/ARP yet: resend this chunk later */
++				break;
++			}
++			keep = pos;
++		}
++	}
++}
++
++static void
++ub_start_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	thread_t thread;
++
++	ub.aon = ml_io_map(AON_PA, AON_SIZE);
++	ub.ana = ml_io_map(ANA_PA, ANA_SIZE);
++	ub.musb = ml_io_map(MUSB_PA, MUSB_SIZE);
++	if (ub.aon == 0 || ub.ana == 0 || ub.musb == 0) {
++		printf("AGM USB: MMIO map failed\n");
++		return;
++	}
++	ub_phy_init();
++	if (!(rd32(ub.aon + AON_EB1) & OTG_UTMI_EB)) {
++		printf("AGM USB: otg clock did not turn on, controller not touched\n");
++		return;
++	}
++	m_wr8(M_INDEX, 0);
++	printf("AGM USB: MUSB hwvers %#x epinfo %#x raminfo %#x configdata %#x power %#x devctl %#x "
++	    "dpktbufdis tx %#x rx %#x\n",
++	    m_rd16(M_HWVERS), m_rd8(M_EPINFO), m_rd8(M_RAMINFO), m_rd8(M_EP(0) + M_CONFIGDATA),
++	    m_rd8(M_POWER), m_rd8(M_DEVCTL), m_rd16(M_TX_DPKTBUFDIS), m_rd16(M_RX_DPKTBUFDIS));
++
++	/* disconnected and quiet, then the FIFO layout, then the pull-up on D+ */
++	m_wr8(M_POWER, m_rd8(M_POWER) & ~POWER_SOFTCONN);
++	m_wr8(M_TESTMODE, 0);
++	m_wr8(M_INTRUSBE, 0);
++	m_wr16(M_INTRTXE, 0);
++	m_wr16(M_INTRRXE, 0);
++	(void)m_rd8(M_INTRUSB);
++	(void)m_rd16(M_INTRTX);
++	(void)m_rd16(M_INTRRX);
++	m_wr8(M_FADDR, 0);
++	if (kmem_alloc_contig(kernel_map, &ub.rxd, RXD_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("AGM USB: no DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ub.rxd);
++	if (!pn) {
++		printf("AGM USB: DMA memory has no physical page\n");
++		return;
++	}
++	ub.rxd_pa = ptoa_64(pn);
++	printf("AGM USB: rx DMA area at %#llx, chn %d cfg %#x intr %#x\n", ub.rxd_pa, RX_CHN,
++	    m_rd32(DMA_CHN_CFG(RX_CHN)), m_rd32(DMA_CHN_INTR(RX_CHN)));
++	ub_fifo_setup();
++	ub_data_eps_reset();
++	ub_if_create();
++	ub_sleep_us(50000);
++	/* status bits are the same with interrupts enabled; the SPI itself stays off in the GIC */
++	m_wr8(M_INTRUSBE, IUSB_SUSPEND | IUSB_RESUME | IUSB_RESET | IUSB_DISCON);
++	m_wr16(M_INTRTXE, (1u << 0) | (1u << EP_DATA) | (1u << EP_NOTIFY));
++	m_wr16(M_INTRRXE, 1u << EP_DATA);
++	m_wr8(M_POWER, POWER_HSENAB | POWER_SOFTCONN);
++	ub_sleep_us(10000);
++	printf("AGM USB: soft connect: power %#x devctl %#x\n", m_rd8(M_POWER), m_rd8(M_DEVCTL));
++
++	if (kernel_thread_start(ub_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	int livelog = 1;
++	PE_parse_boot_argn("agm_usblog", &livelog, sizeof(livelog));
++	if (livelog && ub.ifp != NULL && kernel_thread_start(ub_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++void
++agm_usb_start(void)
++{
++	int on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("agm_usb", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	static lck_grp_t *grp;
++	grp = lck_grp_alloc_init("agm_usb", LCK_GRP_ATTR_NULL);
++	ub.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	if (kernel_thread_start(ub_start_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_AGM */
+-- 
+2.39.5 (Apple Git-154)
+

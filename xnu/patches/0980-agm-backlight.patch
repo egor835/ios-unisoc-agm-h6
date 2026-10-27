@@ -1,0 +1,158 @@
+agm-0980: AGM H6 backlight. SweetFramebuffer drives PWM channel 2 of the sprd
+PWM block (0x643f0000, the stock DT's sprd_backlight, 25 kHz) where topaz sends DSI DCS
+commands: display off sets the duty to 0, display on and IOMFBBrightnessLevel (CoreBrightness,
+nits) set it from the DBV (0..0x7ff) scaled to u-boot's period; the AppleARMBacklight service
+(backlight-control) only with sweetbl=1: CoreBrightness then takes backboardd's main thread. agm_bl=0: left alone.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c3138f6dc..43538bf9c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -182,6 +182,10 @@ public:
+ 	volatile uint32_t *fDpu;        /* AGM H6: the Unisoc DPU (r6p0) when it can scan our surfaces itself */
+ 	uint32_t      fDpuLay;          /* ... byte offset of the layer that shows the boot framebuffer */
+ 	bool          hasScanout(void) const { return fVig0 != NULL || fDpu != NULL; }
++	volatile uint32_t *fPwm;        /* AGM H6: the backlight's PWM channel (sprd PWM 0x643f0000, channel 2) */
++	uint32_t      fPwmMod;          /* ... its period in counter steps (u-boot's) */
++	bool          hasBacklight(void) const { return fDsi != NULL || fPwm != NULL; }
++	void          agmPwmInit(void);
+ 	bool          scanBusy(void);
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
+@@ -367,6 +371,7 @@ AppleCLCD::start(IOService *provider)
+ 	 */
+ 	fDsi = NULL;
+ 	agmDpuInit();
++	agmPwmInit();
+ #else
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+@@ -378,17 +383,26 @@ AppleCLCD::start(IOService *provider)
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+-	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	if (fPwm == NULL) {
++		fBlLevel = 0x133;               /* panel init level (stock DT) */
++	}
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+-	if (fDsi != NULL) {
+-		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++	if (hasBacklight()) {
++		if (fDsi != NULL) {
++			IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++		}
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+ 		 * runs digital dimming, a colour filter over every frame, which the
+ 		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+ 		 */
++		/*
++		 * AGM H6: off too. With the service, CoreBrightness took 42% of backboardd's main
++		 * thread (where HID events go) at once and the UI fell to a frame every few seconds
++		 * although the GPU draws: it expects more of a backlight than this one has.
++		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+@@ -1057,6 +1071,40 @@ AppleCLCD::agmDpuInit(void)
+ #endif
+ }
+ 
++/*
++ * AGM H6: the LCD backlight is PWM channel 2 of the sprd PWM block (0x643f0000; registers per
++ * channel 0x20 apart: PRESCALE +0x0, MOD +0x4, DUTY +0x8, ENABLE +0x18, mainline pwm-sprd.c),
++ * 25 kHz in the stock DT (sprd_backlight). u-boot leaves it running: its period is kept and
++ * only the duty is set. Boot-arg agm_bl=0: left alone.
++ */
++void
++AppleCLCD::agmPwmInit(void)
++{
++#if defined(SWEET_AGM)
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("agm_bl", &on, sizeof(on));
++	volatile uint32_t *p = (volatile uint32_t *)ml_io_map(0x643f0000, 0x1000);
++	if (p == NULL) {
++		return;
++	}
++	volatile uint32_t *c = p + 0x40 / 4;
++	uint32_t prescale = c[0x0 / 4], mod = c[0x4 / 4], duty = c[0x8 / 4], en = c[0x18 / 4];
++	IOLog("SWEET FB: backlight PWM 2: prescale %u mod %u duty %u enable %#x\n", prescale, mod, duty, en);
++	if (!on || !(en & 1) || mod == 0 || mod > 0xffff) {
++		IOLog("SWEET FB: backlight left alone\n");
++		return;
++	}
++	fPwm = c;
++	fPwmMod = mod;
++	/* the level u-boot left, as a DBV (0..0x7ff), so the first "on" keeps it */
++	fBlLevel = (uint32_t)(((uint64_t)duty * 0x7ff + mod / 2) / mod);
++	if (fBlLevel == 0) {
++		fBlLevel = 0x133;
++	}
++	setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
++#endif
++}
++
+ /*
+  * DCS long write through the DSI command DMA path (topaz-woa: the TPG FIFO
+  * path is a no-op on this DSI 2.4.1). The packet lives in a contiguous
+@@ -1149,6 +1197,16 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
++#if defined(SWEET_AGM)
++	if (fPwm != NULL) {
++		/* the LCD backlight off and on (the caller sends the brightness after "on") */
++		if (!on) {
++			setPanelLevel(0);
++		}
++		IOLog("SWEET FB: backlight %s\n", on ? "on" : "off");
++		return;
++	}
++#endif
+ 	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
+ 	uint8_t second[4] = { (uint8_t)(on ? 0x29 : 0x10), 0, 0x05, 0x80 };
+ 	bool done = true;
+@@ -1172,6 +1230,22 @@ AppleCLCD::setPanelOn(bool on)
+ void
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
++#if defined(SWEET_AGM)
++	if (fPwm != NULL) {
++		/* DBV 0..0x7ff -> duty 0..MOD steps (0: off; anything else at least 1 step) */
++		uint32_t duty = level == 0 ? 0 : (uint32_t)(((uint64_t)level * fPwmMod + 0x3ff) / 0x7ff);
++		if (level != 0 && duty == 0) {
++			duty = 1;
++		}
++		fPwm[0x8 / 4] = duty;
++		__asm__ volatile("dsb sy" ::: "memory");
++		static uint32_t logs;
++		if (logs++ < 8) {
++			IOLog("SWEET FB: backlight level %#x: duty %u of %u\n", level, duty, fPwmMod);
++		}
++		return;
++	}
++#endif
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+ 	bool done = dsiDcsLong(cmd, sizeof(cmd));
+@@ -1193,7 +1267,7 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	sweet_bl_log("iomfb", d);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
+-	if (n == NULL || fDsi == NULL) {
++	if (n == NULL || !hasBacklight()) {
+ 		return kIOReturnUnsupported;
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+@@ -1710,7 +1784,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
+-			if (changed && fFB->fDsi != NULL) {
++			if (changed && fFB->hasBacklight()) {
+ 				if (off) {
+ 					fFB->setPanelOn(false);
+ 				} else {

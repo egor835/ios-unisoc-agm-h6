@@ -1,0 +1,239 @@
+agm-0965: AGM H6 touch: Chipone ICNL9916 on SPI3 polled every 20 ms (TCS
+CMD_TP_DATA_COORDINATES_RO, 117-byte full-duplex read, CRC-16/0x8005), up to
+10 fingers into sweet_hid_touch(), coordinates scaled from 720x1612 to the
+topaz 1080x2400 panel space SweetHIDTouch normalises.
+
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index 92a653067..6bd088fd3 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -14,6 +14,14 @@
+  * address >> 2; write: store into the window once the write FIFO (+0x30,
+  * bit 10 empty, bit 11 full) has room. This thread is the only ADI user in xnu.
+  *
++ * Touch: Chipone ICNL9916 TDDI on SPI3 (sprd,sc9860-spi @0x20150000, mode 0,
++ * ~4.3 MHz from 26 MHz), Chipone TCS protocol (Motorola chipone_tddi_mmi_v2):
++ * CMD_TP_DATA_COORDINATES_RO 0x4103 read full duplex in one chip select, 117
++ * bytes = vkey_state, num_msg, 10 x {id, x16, y16, pressure, event} + 40-byte
++ * debug block + {ecode, cmd16, crc16}; CRC-16 poly 0x8005 over the rest.
++ * Probed from the shim: FW ID 0x9916, resolution 720x1612. SweetHIDTouch takes
++ * topaz panel pixels (1080x2400), so coordinates are scaled to that.
++ *
+  * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
+  * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
+  * Here it is reloaded with AGM_WDT_SECS every AGM_WDT_FEED_SECS, as Linux's
+@@ -31,6 +39,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void agm_keys_init(void);
+ 
+ #define ADI_PA			0x64200000UL
+@@ -70,7 +79,37 @@ void agm_keys_init(void);
+ 
+ #define KEYS_POLL_MS		20
+ 
+-static vm_offset_t agm_adi, agm_gpio;
++#define SPI_PA			0x20150000UL
++#define SPI_TXD			0x00
++#define SPI_CLKD		0x04
++#define SPI_CTL0		0x08
++#define SPI_CTL1		0x0c
++#define SPI_CTL5		0x1c
++#define SPI_INT_CLR		0x24
++#define SPI_INT_RAW		0x28
++#define SPI_STS2		0x34
++#define SPI_FIFO_RST		0x48
++#define SPI_CTL7		0x4c
++#define SPI_CTL8		0x54
++#define SPI_CTL9		0x58
++#define SPI_CTL0_CS0		(1u << 8)
++#define SPI_CTL0_CSN		(0xfu << 8)
++#define SPI_CTL1_TX		(1u << 13)
++#define SPI_CTL1_RX		(1u << 12)
++#define SPI_INT_TX_END		(1u << 8)
++#define SPI_STS2_TX_BUSY	(1u << 8)
++#define SPI_FIFO		32
++#define APB_PA			0x20000000UL	/* AP APB gates: SPI3 enable bit 8, set reg +0x1000 */
++#define APCLK_PA		0x20010000UL	/* AP clocks: SPI3 mux/div at +0x58 */
++
++#define TS_RES_X		720
++#define TS_RES_Y		1612
++#define TS_FINGERS		10
++#define TS_INFO_SIZE		112		/* 2 + 10 * 7 + 40, packed */
++#define TS_XFER_SIZE		(TS_INFO_SIZE + 5)
++#define TS_CMD_COORDS		0x4103
++
++static vm_offset_t agm_adi, agm_gpio, agm_spi;
+ static int agm_keys_chan;
+ 
+ static inline uint32_t
+@@ -147,6 +186,133 @@ agm_gpio_get(unsigned n)
+ 	return (rd32(agm_gpio + (n >> 4) * 0x80 + GPIO_DATA) >> (n & 15)) & 1;
+ }
+ 
++static uint16_t
++ts_crc16(const uint8_t *p, unsigned n)
++{
++	uint16_t crc = 0;
++
++	while (n--) {
++		crc ^= (uint16_t)(*p++) << 8;
++		for (int i = 0; i < 8; i++) {
++			crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x8005) : (uint16_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++static bool
++ts_spi_init(void)
++{
++	vm_offset_t apb = ml_io_map(APB_PA, 0x2000), apclk = ml_io_map(APCLK_PA, 0x1000);
++
++	agm_spi = ml_io_map(SPI_PA, 0x1000);
++	if (apb == 0 || apclk == 0 || agm_spi == 0) {
++		return false;
++	}
++	wr32(apb + 0x1000, 1u << 8);				/* SPI3 clock gate on */
++	wr32(apclk + 0x58, rd32(apclk + 0x58) & ~0x703u);	/* 26 MHz source, no divider */
++	delay(10);
++	uint32_t v = rd32(agm_spi + SPI_CTL0) & ~((1u << 13) | 3u | (0x1fu << 2));
++	wr32(agm_spi + SPI_CTL0, v | (1u << 1) | (8u << 2) | SPI_CTL0_CSN);	/* mode 0, 8-bit */
++	wr32(agm_spi + SPI_CTL5, 1);
++	wr32(agm_spi + SPI_FIFO_RST, 1);
++	wr32(agm_spi + SPI_FIFO_RST, 0);
++	wr32(agm_spi + SPI_CTL7, rd32(agm_spi + SPI_CTL7) & ~(7u << 3));	/* 4-wire */
++	wr32(agm_spi + SPI_CLKD, 2);				/* 26 MHz / 2 / 3 = 4.3 MHz */
++	return true;
++}
++
++/* Full duplex in one chip select; false on a controller timeout. */
++static bool
++ts_spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	bool ok = true;
++	uint32_t ctl0 = rd32(agm_spi + SPI_CTL0);
++
++	wr32(agm_spi + SPI_CTL1, (rd32(agm_spi + SPI_CTL1) & ~(SPI_CTL1_TX | SPI_CTL1_RX)) |
++	    SPI_CTL1_TX | SPI_CTL1_RX);
++	wr32(agm_spi + SPI_CTL0, ctl0 & ~SPI_CTL0_CS0);
++	while (len && ok) {
++		unsigned n = len > SPI_FIFO ? SPI_FIFO : len, i;
++		wr32(agm_spi + SPI_CTL8, rd32(agm_spi + SPI_CTL8) & ~0xfu);
++		wr32(agm_spi + SPI_CTL9, n);
++		for (i = 0; i < n; i++) {
++			*(volatile uint8_t *)(agm_spi + SPI_TXD) = tx[i];
++		}
++		for (i = 0; i < 200000 && !(rd32(agm_spi + SPI_INT_RAW) & SPI_INT_TX_END); i++) {
++			;
++		}
++		ok = i < 200000;
++		for (i = 0; ok && i < 200000 && (rd32(agm_spi + SPI_STS2) & SPI_STS2_TX_BUSY); i++) {
++			;
++		}
++		wr32(agm_spi + SPI_INT_CLR, SPI_INT_TX_END);
++		for (i = 0; i < n; i++) {
++			rx[i] = *(volatile uint8_t *)(agm_spi + SPI_TXD);
++		}
++		tx += n;
++		rx += n;
++		len -= n;
++	}
++	wr32(agm_spi + SPI_CTL0, rd32(agm_spi + SPI_CTL0) | SPI_CTL0_CSN);
++	wr32(agm_spi + SPI_CTL1, rd32(agm_spi + SPI_CTL1) & ~(SPI_CTL1_TX | SPI_CTL1_RX));
++	return ok;
++}
++
++/* -1 SPI timeout, -2 CRC error, else the number of reported touches. */
++static int
++ts_read(uint8_t *rx)
++{
++	uint8_t tx[TS_XFER_SIZE] = { 0xf1, TS_CMD_COORDS & 0xff, TS_CMD_COORDS >> 8,
++		                     TS_XFER_SIZE & 0xff, TS_XFER_SIZE >> 8 };
++	uint16_t c = ts_crc16(tx, 5);
++
++	tx[5] = c & 0xff;
++	tx[6] = c >> 8;
++	if (!ts_spi_xfer(tx, rx, TS_XFER_SIZE)) {
++		return -1;
++	}
++	if (ts_crc16(rx, TS_XFER_SIZE - 2) != (uint16_t)(rx[TS_XFER_SIZE - 2] | rx[TS_XFER_SIZE - 1] << 8)) {
++		return -2;
++	}
++	return rx[1] > TS_FINGERS ? TS_FINGERS : rx[1];
++}
++
++static void
++ts_poll(bool *down, unsigned *errors)
++{
++	uint8_t rx[TS_XFER_SIZE];
++	bool seen[TS_FINGERS] = { false };
++	int n = ts_read(rx);
++
++	if (n < 0) {
++		if (((*errors)++ % 500u) == 0) {
++			printf("AGM TOUCH: read error %d\n", n);
++		}
++		return;
++	}
++	for (int i = 0; i < n; i++) {
++		const uint8_t *m = rx + 2 + i * 7;
++		int id = m[0], x = m[1] | m[2] << 8, y = m[3] | m[4] << 8, ev = m[6];
++		if (id >= TS_FINGERS) {
++			continue;
++		}
++		bool d = ev >= 1 && ev <= 3;
++		seen[id] = d;
++		if (d != down[id]) {
++			printf("AGM TOUCH: finger %d %s at %d,%d\n", id, d ? "down" : "up", x, y);
++		}
++		down[id] = d;
++		sweet_hid_touch(id, d, x * 1080 / TS_RES_X, y * 2400 / TS_RES_Y);
++	}
++	for (int id = 0; id < TS_FINGERS; id++) {
++		if (down[id] && !seen[id]) {
++			down[id] = false;
++			sweet_hid_touch(id, 0, 0, 0);
++		}
++	}
++}
++
+ static void
+ agm_keys_wait(void)
+ {
+@@ -162,7 +328,8 @@ agm_keys_thread(void *arg, wait_result_t result)
+ {
+ 	/* sweet_hid_key: 0 power, 1 volume up, 2 volume down */
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0, ticks = 0;
++	unsigned errors = 0, ticks = 0, ts_errors = 0;
++	bool ts_down[TS_FINGERS] = { false };
+ 	(void)arg;
+ 	(void)result;
+ 
+@@ -186,6 +353,9 @@ agm_keys_thread(void *arg, wait_result_t result)
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		if (agm_spi != 0) {
++			ts_poll(ts_down, &ts_errors);
++		}
+ 		if (++ticks >= AGM_WDT_FEED_SECS * 1000 / KEYS_POLL_MS) {
+ 			ticks = 0;
+ 			agm_wdt_feed();
+@@ -207,6 +377,13 @@ agm_keys_init(void)
+ 		return;
+ 	}
+ 	agm_gpio_input(GPIO_VOLDOWN);
++	if (!ts_spi_init()) {
++		agm_spi = 0;
++		printf("AGM TOUCH: SPI3 map failed\n");
++	} else {
++		uint8_t rx[TS_XFER_SIZE];
++		printf("AGM TOUCH: ICNL9916 on SPI3, first read %d\n", ts_read(rx));
++	}
+ 	if (pmic_read(EIC_DMSK, &dmsk)) {
+ 		pmic_write(EIC_DMSK, dmsk | (1u << EIC_POWER) | (1u << EIC_VOLUP));
+ 	}

@@ -1,0 +1,29 @@
+agm-0978: AGM H6 Mali: boot-arg agm_gpu_mux sets the core clock's mux alone
+(1 384, 2 512, 3 614.4 MHz; the memory clock is left as u-boot set it), and completion is polled
+every 20 us instead of 100 (about a thousand jobs a second: the gaps between them were up to a
+tenth of the GPU's time).
+
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+index 1424422bf..96e5273a9 100644
+--- a/iokit/Kernel/arm/AgmMali.cpp
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -184,7 +184,7 @@ void agm_mali_selftest(void);
+ #define VA_END                  (4ull << 30)
+ 
+ #define JOB_RING                64
+-#define WAIT_POLL_US            100
++#define WAIT_POLL_US            20
+ 
+ static volatile uint8_t *mali, *gapb, *pmu, *aon;
+ static IOLock *hw_lock;
+@@ -592,8 +592,8 @@ power_up(void)
+ 	(void)PE_parse_boot_argn("agm_gpu_mux", &mux, sizeof(mux));
+ 	for (uint32_t r = 0x4; r <= 0x8; r += 4) {
+ 		uint32_t v = *(volatile uint32_t *)(gapb + r);
+-		if (mux <= 5) {
+-			v = (v & ~0x770u) | (mux << 4);
++		if (mux <= 5 && r == 0x4) {
++			v = (v & ~0x770u) | (mux << 4);         /* the core clock only: 1 384, 2 512, 3 614.4 MHz */
+ 		}
+ 		*(volatile uint32_t *)(gapb + r) = v | 1u;                      /* core, mem: gate on */
+ 	}

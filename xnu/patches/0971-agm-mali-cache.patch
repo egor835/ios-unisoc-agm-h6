@@ -1,0 +1,168 @@
+agm-0971: AgmMali.cpp recovers from a GPU MMU fault or a job that does not end in 2 s by hard
+stop + GPU reset (the job counts as failed). AgmMaliGPU buffers are ordinary cached memory,
+pushed out of the processors' caches at every submission naming them once mapped and after
+WAIT_BO (like topaz gpu_cached=1): write-combined IOBMD allocations get physical addresses
+with the top bit lost here (phystokv panic), even with a 40-bit mask; the jobs had failed
+with DATA_INVALID_FAULT 0x58 when what Mesa wrote stayed in the caches.
+
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+index 6b40c3bf8..10814882c 100644
+--- a/iokit/Kernel/arm/AgmMali.cpp
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -627,6 +627,34 @@ start_next(void)
+ 	ring_count--;
+ }
+ 
++static bool gpu_reset(void);
++static void start_next(void);
++
++/*
++ * With hw_lock held: the running job is given up (a fault the GPU waits on for ever, or no end
++ * in time): the slot is stopped, the GPU reset and set up again (page tables stay), and the
++ * job counts as done -- failed -- so the next can start. As panfrost does after such a fault.
++ */
++static void
++recover(const char *why)
++{
++	static uint32_t told;
++
++	if (told++ < 8) {
++		report_faults(why);
++	}
++	wr(JS_BASE + running_slot * 0x80 + 0x20, JS_COMMAND_HARD_STOP);
++	IODelay(100);
++	if (!gpu_reset()) {
++		IOLog("AGM MALI: the GPU did not come back after a reset: given up\n");
++		broken = true;
++	}
++	jobs_failed++;
++	done_seqno = running_seqno;
++	running_seqno = 0;
++	start_next();
++}
++
+ /* With hw_lock held: has the running job ended? Then the next one starts. */
+ static void
+ check(void)
+@@ -639,12 +667,9 @@ check(void)
+ 	uint32_t mmu = rd(MMU_INT_RAWSTAT);
+ 
+ 	if (mmu != 0) {
+-		static uint32_t told;
+-		if (told++ < 8) {
+-			report_faults("GPU MMU fault");
+-		}
+-		/* the job will fail on it: the fault is let go of, as panfrost does for one it cannot mend */
+-		wr(MMU_INT_CLEAR, mmu);
++		/* nothing is mapped on demand here: the job would wait on the fault for ever */
++		recover("GPU MMU fault");
++		return;
+ 	}
+ 	if (raw & ((1u << slot) | (1u << (16 + slot)))) {
+ 		if (raw & (1u << (16 + slot))) {
+@@ -665,14 +690,7 @@ check(void)
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - running_since, &ns);
+ 	if (ns > 2 * NSEC_PER_SEC) {
+-		report_faults("job takes over 2 s: stopped");
+-		wr(JS_BASE + slot * 0x80 + 0x20, JS_COMMAND_HARD_STOP);
+-		IODelay(1000);
+-		wr(JOB_INT_CLEAR, 0xffffffff);
+-		jobs_failed++;
+-		done_seqno = running_seqno;
+-		running_seqno = 0;
+-		start_next();
++		recover("job takes over 2 s");
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/AgmMaliGPU.cpp b/iokit/Kernel/arm/AgmMaliGPU.cpp
+index f67953195..1d8cad433 100644
+--- a/iokit/Kernel/arm/AgmMaliGPU.cpp
++++ b/iokit/Kernel/arm/AgmMaliGPU.cpp
+@@ -8,10 +8,11 @@
+  * in and back (userland: redwood-drm built for panfrost). mmap() of a buffer is the client
+  * memory of the type that is the buffer's handle. The hardware is AgmMali.cpp.
+  *
+- * Buffers: wired kernel memory, mapped write-combined into programs (the GPU is not coherent
+- * with the processors); in the kernel it is ordinary memory, its zeroes pushed out of the
+- * caches once when made (write-combined or contiguous allocations come from outside RAM in
+- * this kernel), and the kernel does not touch it after that. Entered page by page into the GPU's address space at an address chosen here
++ * Buffers: wired kernel memory, ordinary cached memory in the kernel and in programs (the GPU
++ * is not coherent with the processors, and write-combined allocations are broken here: see
++ * createBo()): zeroed and pushed out of the caches when made, and pushed out again at every
++ * submission that names it once the program has mapped it, like topaz's gpu_cached=1.
++ * Entered page by page into the GPU's address space at an address chosen here
+  * (32 MB - 4 GB). A heap buffer (PANFROST_BO_HEAP, the tiler heap) gets all its memory at
+  * once instead of on GPU faults; nobody maps it.
+  *
+@@ -147,6 +148,7 @@ struct gpu_buffer {
+ 	uint64_t address, size;                 /* the GPU's */
+ 	uint32_t flags;
+ 	bool seen;                              /* mapped by the program */
++	bool cached;                            /* ordinary cached memory: pushed out of the caches at submissions */
+ 	uint64_t seqno;                         /* the last submission that names it */
+ };
+ 
+@@ -367,8 +369,18 @@ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ 	if (size == 0 || size > GPU_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
+-	    (vm_size_t)size, PAGE_SIZE);
++	/*
++	 * Ordinary cached memory: write-combined (or contiguous) IOBMD allocations get physical
++	 * addresses outside RAM in this kernel (the top bit lost: phystokv panic), whatever the
++	 * mask. What programs write through their mappings is pushed out of the processors'
++	 * caches at every submission that names the buffer (submit()); the heap only the GPU uses.
++	 */
++	bool cached = true;
++	memory = NULL;
++	if (memory == NULL) {
++		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++		    (vm_size_t)size, PAGE_SIZE);
++	}
+ 	if (memory == NULL) {
+ 		IOLog("AgmMaliGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount,
+ 		    fBufferBytes >> 20);
+@@ -381,6 +393,7 @@ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ 	if (b != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *)memory->getBytesNoCopy();
++		b->cached = cached && !heap;
+ 		r->offset = b->address;
+ 	}
+ 	IOLockUnlock(gLock);
+@@ -485,7 +498,7 @@ AgmMaliGPUUserClient::submit(struct pan_submit *r)
+ 	/* surfaces are cached memory: what the processors wrote goes out to memory, what they hold goes */
+ 	for (uint32_t i = 0; i < r->bo_handle_count; i++) {
+ 		struct gpu_buffer *b = buffer(handles[i]);
+-		if (b != NULL && b->surface != NULL) {
++		if (b != NULL && (b->surface != NULL || (b->cached && b->seen))) {
+ 			sweet_dcache_flush((vm_offset_t)b->kernel, (unsigned)b->size);
+ 		}
+ 	}
+@@ -523,7 +536,7 @@ AgmMaliGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IO
+ 		b->memory->retain();
+ 		b->seen = true;
+ 		*memory = b->memory;
+-		*options = kIOMapWriteCombineCache;
++		*options = 0;                   /* (the memory's own cache mode) */
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gLock);
+@@ -606,6 +619,14 @@ AgmMaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 			ret = kIOReturnBadArgument;
+ 		} else if (seqno != 0 && !agm_mali_wait(seqno, milliseconds(r.waitBo.timeout_ns))) {
+ 			ret = kIOReturnTimeout;
++		} else if (seqno != 0) {
++			/* what the GPU wrote is read from memory, not from what the caches still hold */
++			IOLockLock(gLock);
++			b = buffer(r.waitBo.handle);
++			if (b != NULL && b->cached && b->seen) {
++				sweet_dcache_flush((vm_offset_t)b->kernel, (unsigned)b->size);
++			}
++			IOLockUnlock(gLock);
+ 		}
+ 		break;
+ 	case kAgmWaitSeqno:

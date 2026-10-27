@@ -1,0 +1,16 @@
+# device data, firmware and build output stay local
+backup/
+logs/
+xnu-out/
+ios/
+ref/
+adt/
+shell/out/
+shim-agm/out/
+gpu/out/
+gpu/mesa-src/
+wcn/*.bin
+wcn/*.ini
+wifimac.local
+*.img
+__pycache__/

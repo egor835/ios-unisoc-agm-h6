@@ -1,0 +1,202 @@
+agm-0960: AGM H6 (Unisoc T606 / UMS9230) board, behind SWEET_AGM=1 in the build
+environment (like TOPAZ_4K): CPU topology MT/Aff1 with boot on CPU0, early console
+on the u-boot framebuffer 0x9e000000 720x1612, no Qualcomm modem/audio/Adreno/MDP/DSI,
+touch/keys/USB or battery gauge/cpufreq. Frames go straight to the boot framebuffer.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60b7..b0ebfff27 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -819,6 +819,9 @@ sweet_ufs_init(void)
+ 	 * topaz; sweettouch=0 / sweetkeys=0 disable them. USB still pokes SM7150
+ 	 * MMIO (DWC3 at 0xa600000), so it only runs with sweethw=1.
+ 	 */
++#if defined(SWEET_AGM)
++	printf("SWEET UFS: touch/keys/USB skipped (AGM H6: no Qualcomm QUP/SPMI/DWC3)\n");
++#else
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
+@@ -828,6 +831,7 @@ sweet_ufs_init(void)
+ 	} else {
+ 		printf("SWEET UFS: USB skipped (topaz, sweethw=0)\n");
+ 	}
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index ed9a0c7f0..a6a988d0b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -435,9 +435,13 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(SWEET_AGM)
++	int real = 0;   /* AGM H6: static fallback only (gauge/charger are Qualcomm-only here) */
++#else
+ 	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++#endif
+ 	fReal = real == 1 && sweet_i2c1_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 96c557b0e..789cb9f6c 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,9 +73,15 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(SWEET_AGM)
++	/* AGM H6 (UMS9230): MPIDR.MT = 1, Aff1 = core 0-7 (0-5 A55, 6-7 A75), Aff0 = 0 */
++	if ((cpu->phys_id >> 8) > 7 || (cpu->phys_id & 0xff) != 0 ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#else
+ 	/* topaz (SM6225): MPIDR Aff1 = cluster, Aff0 = core: 0x0-0x3 A53, 0x100-0x103 A73 */
+ 	if ((cpu->phys_id >> 8) > 1 || (cpu->phys_id & 0xff) > 3 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#endif
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -148,8 +154,14 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	 * topaz: the ADT lists only the A73 (gold) cores and the shim boots xnu
+ 	 * on gold CPU 0x100 (the silver cluster has no 16K granule).
+ 	 */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100) {
+-		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
++#if defined(SWEET_AGM)
++	/* AGM H6: the shim boots xnu on CPU0 (MPIDR 0x000); every core has the 16K granule. */
++	const uint32_t boot_mpidr = 0x000;
++#else
++	const uint32_t boot_mpidr = 0x100;
++#endif
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != boot_mpidr) {
++		panic("SWEET CPU: expected boot MPIDR 0x%x and logical CPU 0, got 0x%x/%u", boot_mpidr,
+ 		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d3ee1771..30036b154 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,8 +312,10 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++#if !defined(SWEET_AGM)
+ 	topaz_modem_init();
+ 	topaz_audio_init();
++#endif
+ 	sweet_amfi_service_init();
+ 	sweet_busy_init();
+ 	PE_current_console(&video);
+@@ -352,11 +354,20 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++#if defined(SWEET_AGM)
++	/*
++	 * AGM H6: none of the Qualcomm display/GPU blocks exist. fVig0/fCtl0/fDsi/
++	 * fIntf1 stay NULL, which is the path without direct MDP scanout: frames
++	 * are drawn straight into the u-boot framebuffer that the DPU scans out.
++	 */
++	fDsi = NULL;
++#else
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++#endif
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -399,7 +410,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(accel);
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
++#if !defined(SWEET_AGM)
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++#endif
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 798f14608..a7473bb9d 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,7 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1)
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1) $(if $(filter 1,$(SWEET_AGM)),-DSWEET_AGM=1)
+ 
+ 
+ #
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b926886d8..50954b66d 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1881,7 +1881,11 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
++#if defined(SWEET_AGM)
++	*slot = 0x9e000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++#else
+ 	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++#endif
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 9fd1cb9cc..dae42d691 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -712,7 +712,11 @@ Ltopaz_fb_block:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
++#if defined(SWEET_AGM)
++	MOV64	x10, 0x9e000000		/* AGM H6 u-boot logo framebuffer, 32 MB aligned */
++#else
+ 	MOV64	x10, 0x9c000000
++#endif
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 9429767f9..50bedf1d5 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,15 +11,23 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-#if defined(TOPAZ_4K)
++#if defined(SWEET_AGM)
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9e000000;  /* AGM H6 u-boot logo */
++#elif defined(TOPAZ_4K)
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x5c000000;  /* topaz splash */
+ #else
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #endif
+ #define EARLY_FB early_fb
++#if defined(SWEET_AGM)
++#define EARLY_WIDTH 720u
++#define EARLY_HEIGHT 1612u
++#define EARLY_STRIDE (2880u / 4)
++#else
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+ #define EARLY_STRIDE (4320u / 4)
++#endif
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)

@@ -1,0 +1,586 @@
+agm-0982: AGM H6 Wi-Fi step 2 (bsd/dev/agm_wcn_sipc.c): once the WCN firmware is up, SIPC over
+the mailbox (0x641c0000/0x641d0000, WCN = core 8, polled) and the smem pool (0x87240000, CP 0x240000):
+sbuf channels 5 (log), 11 (loopcheck), 12 (assert) and the sblock Wi-Fi command channel 7; sends
+WIFI_CMD_SYNC_VERSION and prints the answer, the firmware's log and asserts.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b2f4ceed4..67623025d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/agm_keys.c			standard
+ bsd/dev/agm_dropbox.c			standard
+ bsd/dev/agm_wcn.c			standard
++bsd/dev/agm_wcn_sipc.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/agm_wcn.c b/bsd/dev/agm_wcn.c
+index 02734d77e..8615796ef 100644
+--- a/bsd/dev/agm_wcn.c
++++ b/bsd/dev/agm_wcn.c
+@@ -48,6 +48,7 @@ extern bool agm_pmic_rd(uint32_t reg, uint32_t *val);
+ extern bool agm_pmic_wr(uint32_t reg, uint32_t val);
+ extern void agm_gpio_out(unsigned n, int value);
+ extern void IOSleep(unsigned int milliseconds);
++extern void agm_wcn_sipc_run(void);
+ extern int sweet_ufs_dump(uint64_t off, const void *src, uint64_t len);
+ void agm_wcn_start(void);
+ 
+@@ -412,6 +413,9 @@ agm_wcn_thread(void *arg, __unused wait_result_t wr_)
+ 	ddr_wr(WCN_SYNC + SYNC_INIT_STATUS, CP_INIT_SUCCESS);
+ 	printf("AGM WCN: CP ready after %d ms; loopcheck %#x, cp2 sleep %#x\n", i * 9,
+ 	    ddr_rd(WCN_SYNC + 4), ddr_rd(WCN_SYNC + SYNC_CP2_SLEEP));
++	kfree_data(fw, len);
++	agm_wcn_sipc_run();                             /* step 2: SIPC (agm_wcn_sipc.c), does not return */
++	return;
+ out:
+ 	kfree_data(fw, len);
+ }
+diff --git a/bsd/dev/agm_wcn_sipc.c b/bsd/dev/agm_wcn_sipc.c
+new file mode 100644
+index 000000000..5aa7d571a
+--- /dev/null
++++ b/bsd/dev/agm_wcn_sipc.c
+@@ -0,0 +1,541 @@
++/*
++ * AGM H6 Wi-Fi, step 2: talk to the Marlin3 WCN firmware (started by agm_wcn.c) over SIPC.
++ *
++ * After the vendor kernel (Realme C53: drivers/soc/sprd/modem/sipc/{smsg,sbuf,sblock}.c,
++ * drivers/unisoc_platform/mailbox/unisoc-mailbox-phy-r2.c, drivers/unisoc_platform/sprdwcn/sipc/wcn_sipc.c)
++ * and this phone's FDT (sipc-virt core@3: mboxes <&mailbox 8>, sprd,smem-info <0x87240000 0x240000 0x140000>):
++ *   smsg      8-byte messages {channel, type, flag, value} that go straight through the mailbox
++ *             (no rings: this SIPC is of the mailbox kind): AP inbox 0x641c0000 (MSG_LOW/HIGH, ID = 8 for
++ *             the WCN, TRIGGER), AP outbox 0x641d0000 (FIFO_STS1 write/read positions, MSG_LOW/HIGH, ID,
++ *             TRIGGER pops). Polled here; the outbox also carries other processors' messages (dropped).
++ *   channels  the AP (host) allocates each channel's shared memory from the smem pool (0x87240000, which the
++ *             CP sees at 0x240000), sends OPEN (flag 0xbeee), the CP answers OPEN and asks CMD INIT (flag 1);
++ *             the AP answers DONE (flag 2) with the memory's CP address. Then EVENTs say what moved.
++ *   sblock    blocks: a ring and a pool header (12 words each: tx addr/count/size/blks/rdptr/wrptr, rx same),
++ *             then the blocks, then {addr, length} lists. Send: block from the tx pool, onto the tx ring,
++ *             EVENT SEND (flag 1). Receive: off the rx ring, back onto the rx pool, EVENT RELEASE (flag 2).
++ *   sbuf      byte rings: {ringnr, {txaddr, txsize, txrd, txwr, rxaddr, rxsize, rxrd, rxwr} per ring}.
++ * WCN channels (wcn_sipc.c): 4 AT/BT/FM sbuf, 5 log sbuf, 11 loopcheck sbuf, 12 assert sbuf, 7 Wi-Fi commands
++ * sblock (4 x 2048 tx, 8 x 2048 rx), 8 and 9 Wi-Fi data sblocks.
++ * Wi-Fi commands (sc2355 driver, msg.h): {u8 type:3 (0 cmd, 1 event), reserv:1, rsp:1, ctx_id:3; u8 cmd_id;
++ * le16 plen (header included); le32 mstime; s8 status; u8 rsp_cnt; u8 reserv[2]} then the payload.
++ *
++ * This step opens channels 5, 11, 12 and 7, sends WIFI_CMD_SYNC_VERSION and prints what comes back, then
++ * keeps printing the firmware's log, asserts and events.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern void IOSleep(unsigned int milliseconds);
++void agm_wcn_sipc_run(void);
++
++#define MBOX_IN_PA              0x641c0000UL
++#define MBOX_OUT_PA             0x641d0000UL
++#define MBOX_ID                 0x00
++#define MBOX_MSG_LOW            0x04
++#define MBOX_MSG_HIGH           0x08
++#define MBOX_TRIGGER            0x0c
++#define MBOX_FIFO_RST           0x10
++#define MBOX_FIFO_STS1          0x14
++#define MBOX_IRQ_STS            0x18
++#define MBOX_IRQ_MSK            0x1c
++#define MBOX_FIFO_STS2          0x24            /* inbox: block bits; outbox: depth - 1 */
++#define MBOX_WCN                8
++
++#define SMEM_PA                 0x87240000UL
++#define SMEM_SIZE               0x140000u
++#define SMEM_DST                0x240000u
++
++enum { T_NONE, T_OPEN, T_CLOSE, T_DATA, T_EVENT, T_CMD, T_DONE };
++#define OPEN_MAGIC              0xbeee
++#define CLOSE_MAGIC             0xeddd
++#define CMD_INIT                1
++#define DONE_INIT               2
++#define EV_SBLOCK_SEND          1
++#define EV_SBLOCK_RELEASE       2
++#define EV_SBUF_WRPTR           1
++#define EV_SBUF_RDPTR           2
++
++#define CH_LOG                  5
++#define CH_WIFI_CMD             7
++#define CH_LOOPCHECK            11
++#define CH_ASSERT               12
++#define NCH                     16
++
++#define WIFI_CMD_SYNC_VERSION   9
++
++static vm_offset_t mbin, mbout, smem;
++static uint32_t smem_used, out_depth;
++
++struct chan {
++	uint8_t kind;                   /* 0 none, 1 sbuf, 2 sblock */
++	uint8_t peer_open, open, ready;
++	uint32_t dst;                   /* CP address of the channel's memory */
++	vm_offset_t v;
++	uint32_t events;                /* EVENTs seen */
++	/* sblock */
++	uint32_t txnum, txsz, rxnum, rxsz;
++	/* sbuf (one ring) */
++	uint32_t txsize, rxsize;
++};
++static struct chan ch[NCH];
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	return *(volatile uint32_t *)(b + off);
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static vm_offset_t
++cpv(uint32_t dst)                       /* CP address in the pool -> our mapping */
++{
++	return smem + (dst - SMEM_DST);
++}
++
++static uint32_t
++smem_alloc(uint32_t size)
++{
++	uint32_t at = smem_used;
++
++	size = (size + 0xfff) & ~0xfffu;
++	if (at + size > SMEM_SIZE) {
++		return 0;
++	}
++	smem_used += size;
++	for (uint32_t o = 0; o < size; o += 4) {
++		*(volatile uint32_t *)(smem + at + o) = 0;
++	}
++	return SMEM_DST + at;
++}
++
++static bool
++mbox_send(uint8_t channel, uint8_t type, uint16_t flag, uint32_t value)
++{
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		if (!(rd(mbin, MBOX_FIFO_STS2) & (1u << MBOX_WCN)) && !(rd(mbin, MBOX_FIFO_STS1) & (1u << (16 + MBOX_WCN)))) {
++			break;
++		}
++		delay(10);
++	}
++	if (i == 1000) {
++		printf("AGM SIPC: mailbox busy (sts1 %#x sts2 %#x), ch %u type %u not sent\n",
++		    rd(mbin, MBOX_FIFO_STS1), rd(mbin, MBOX_FIFO_STS2), channel, type);
++		return false;
++	}
++	wr(mbin, MBOX_MSG_LOW, channel | (uint32_t)type << 8 | (uint32_t)flag << 16);
++	wr(mbin, MBOX_MSG_HIGH, value);
++	wr(mbin, MBOX_ID, MBOX_WCN);
++	wr(mbin, MBOX_TRIGGER, 1);
++	return true;
++}
++
++/* ---- sblock ---- */
++#define SB_RING                 0               /* ring header words */
++#define SB_POOL                 12              /* pool header words */
++enum { TXADDR, TXCOUNT, TXSIZE, TXBLKS, TXRD, TXWR, RXADDR, RXCOUNT, RXSIZE, RXBLKS, RXRD, RXWR };
++
++static uint32_t
++sbh(struct chan *c, int hdr, int w)
++{
++	return rd(c->v, (uint32_t)(hdr + w) * 4);
++}
++
++static void
++sbh_set(struct chan *c, int hdr, int w, uint32_t v)
++{
++	wr(c->v, (uint32_t)(hdr + w) * 4, v);
++}
++
++static bool
++sblock_create(int n, uint32_t txnum, uint32_t txsz, uint32_t rxnum, uint32_t rxsz)
++{
++	struct chan *c = &ch[n];
++	uint32_t hsize = 96, size = hsize + txnum * txsz + rxnum * rxsz + (txnum + rxnum) * 8 * 2;
++
++	c->dst = smem_alloc(size);
++	if (c->dst == 0) {
++		return false;
++	}
++	c->v = cpv(c->dst);
++	c->kind = 2;
++	c->txnum = txnum;
++	c->txsz = txsz;
++	c->rxnum = rxnum;
++	c->rxsz = rxsz;
++	uint32_t txaddr = c->dst + hsize, rxaddr = txaddr + txnum * txsz;
++	uint32_t r_txblks = rxaddr + rxnum * rxsz, r_rxblks = r_txblks + txnum * 8;
++	uint32_t p_txblks = r_rxblks + rxnum * 8, p_rxblks = p_txblks + txnum * 8;
++	uint32_t ring[12] = { txaddr, txnum, txsz, r_txblks, 0, 0, rxaddr, rxnum, rxsz, r_rxblks, 0, 0 };
++	uint32_t pool[12] = { txaddr, txnum, txsz, p_txblks, 0, txnum, rxaddr, rxnum, rxsz, p_rxblks, 0, rxnum };
++	for (int w = 0; w < 12; w++) {
++		sbh_set(c, SB_RING, w, ring[w]);
++		sbh_set(c, SB_POOL, w, pool[w]);
++	}
++	for (uint32_t i = 0; i < txnum; i++) {
++		wr(cpv(r_txblks), i * 8, txaddr + i * txsz);
++		wr(cpv(r_txblks), i * 8 + 4, 0);
++		wr(cpv(p_txblks), i * 8, txaddr + i * txsz);
++		wr(cpv(p_txblks), i * 8 + 4, txsz);
++	}
++	for (uint32_t i = 0; i < rxnum; i++) {
++		wr(cpv(r_rxblks), i * 8, rxaddr + i * rxsz);
++		wr(cpv(r_rxblks), i * 8 + 4, 0);
++		wr(cpv(p_rxblks), i * 8, rxaddr + i * rxsz);
++		wr(cpv(p_rxblks), i * 8 + 4, rxsz);
++	}
++	return true;
++}
++
++/* a free tx block (CP address), or 0 */
++static uint32_t
++sblock_get(struct chan *c)
++{
++	uint32_t r = sbh(c, SB_POOL, TXRD), w = sbh(c, SB_POOL, TXWR);
++
++	if (r == w) {
++		return 0;
++	}
++	uint32_t a = rd(cpv(sbh(c, SB_POOL, TXBLKS)), (r % c->txnum) * 8);
++	sbh_set(c, SB_POOL, TXRD, r + 1);
++	return a;
++}
++
++static void
++sblock_send(int n, uint32_t addr, uint32_t len)
++{
++	struct chan *c = &ch[n];
++	uint32_t w = sbh(c, SB_RING, TXWR);
++	vm_offset_t blks = cpv(sbh(c, SB_RING, TXBLKS));
++
++	wr(blks, (w % c->txnum) * 8, addr);
++	wr(blks, (w % c->txnum) * 8 + 4, len);
++	sbh_set(c, SB_RING, TXWR, w + 1);
++	(void)mbox_send((uint8_t)n, T_EVENT, EV_SBLOCK_SEND, 0);
++}
++
++/* the next received block: its CP address and length; false when none */
++static bool
++sblock_receive(struct chan *c, uint32_t *addr, uint32_t *len)
++{
++	uint32_t r = sbh(c, SB_RING, RXRD), w = sbh(c, SB_RING, RXWR);
++
++	if (r == w) {
++		return false;
++	}
++	vm_offset_t blks = cpv(sbh(c, SB_RING, RXBLKS));
++	*addr = rd(blks, (r % c->rxnum) * 8);
++	*len = rd(blks, (r % c->rxnum) * 8 + 4);
++	sbh_set(c, SB_RING, RXRD, r + 1);
++	return true;
++}
++
++static void
++sblock_release(int n, uint32_t addr)
++{
++	struct chan *c = &ch[n];
++	uint32_t w = sbh(c, SB_POOL, RXWR);
++	vm_offset_t blks = cpv(sbh(c, SB_POOL, RXBLKS));
++
++	wr(blks, (w % c->rxnum) * 8, addr);
++	wr(blks, (w % c->rxnum) * 8 + 4, c->rxsz);
++	sbh_set(c, SB_POOL, RXWR, w + 1);
++	if (w + 1 - sbh(c, SB_POOL, RXRD) == 1) {
++		(void)mbox_send((uint8_t)n, T_EVENT, EV_SBLOCK_RELEASE, 0);
++	}
++}
++
++/* ---- sbuf (one ring per channel here) ---- */
++#define SBUF_HDR                4               /* after ringnr */
++enum { B_TXADDR, B_TXSIZE, B_TXRD, B_TXWR, B_RXADDR, B_RXSIZE, B_RXRD, B_RXWR };
++
++static bool
++sbuf_create(int n, uint32_t txsize, uint32_t rxsize)
++{
++	struct chan *c = &ch[n];
++	uint32_t hsize = 4 + 32;
++
++	c->dst = smem_alloc(hsize + txsize + rxsize);
++	if (c->dst == 0) {
++		return false;
++	}
++	c->v = cpv(c->dst);
++	c->kind = 1;
++	c->txsize = txsize;
++	c->rxsize = rxsize;
++	wr(c->v, 0, 1);
++	uint32_t h[8] = { c->dst + hsize, txsize, 0, 0, c->dst + hsize + txsize, rxsize, 0, 0 };
++	for (int w = 0; w < 8; w++) {
++		wr(c->v, SBUF_HDR + (uint32_t)w * 4, h[w]);
++	}
++	return true;
++}
++
++/* what the CP wrote into our rx ring, printed as text (printable runs) */
++static void
++sbuf_drain(int n, const char *what)
++{
++	struct chan *c = &ch[n];
++	uint32_t r = rd(c->v, SBUF_HDR + B_RXRD * 4), w = rd(c->v, SBUF_HDR + B_RXWR * 4);
++	uint32_t size = c->rxsize, n_ = w - r;
++	vm_offset_t buf = cpv(rd(c->v, SBUF_HDR + B_RXADDR * 4));
++	char line[161];
++	unsigned k = 0;
++
++	if (n_ == 0 || n_ > size) {
++		return;
++	}
++	for (uint32_t i = 0; i < n_; i++) {
++		char b = *(volatile char *)(buf + (r + i) % size);
++		if (b >= 0x20 && b < 0x7f && k < sizeof(line) - 1) {
++			line[k++] = b;
++		} else if ((b == '\n' || b == 0 || k == sizeof(line) - 1) && k > 0) {
++			line[k] = 0;
++			printf("AGM WCN %s: %s\n", what, line);
++			k = 0;
++		}
++	}
++	if (k > 0) {
++		line[k] = 0;
++		printf("AGM WCN %s: %s\n", what, line);
++	}
++	wr(c->v, SBUF_HDR + B_RXRD * 4, w);
++	if (n_ == size) {
++		(void)mbox_send((uint8_t)n, T_EVENT, EV_SBUF_RDPTR, 0);
++	}
++}
++
++/* ---- the mailbox's messages for us ---- */
++static void
++smsg_handle(uint8_t n, uint8_t type, uint16_t flag, uint32_t value)
++{
++	struct chan *c = n < NCH ? &ch[n] : NULL;
++
++	if (c == NULL || c->kind == 0 || type != T_EVENT) {
++		printf("AGM SIPC: rx ch %u type %u flag %#x value %#x\n", n, type, flag, value);
++	}
++	if (c == NULL) {
++		return;
++	}
++	switch (type) {
++	case T_OPEN:
++		if (flag != OPEN_MAGIC) {
++			break;
++		}
++		if (c->open) {
++			(void)mbox_send(n, T_OPEN, OPEN_MAGIC, 0);         /* reopened by the CP */
++			c->ready = 0;
++		}
++		c->peer_open = 1;
++		break;
++	case T_CLOSE:
++		(void)mbox_send(n, T_CLOSE, CLOSE_MAGIC, 0);
++		c->ready = 0;
++		break;
++	case T_CMD:
++		if (c->kind != 0 && flag == CMD_INIT) {
++			(void)mbox_send(n, T_DONE, DONE_INIT, c->dst);
++			c->ready = 1;
++			printf("AGM SIPC: ch %u ready (CP address %#x)\n", n, c->dst);
++		}
++		break;
++	case T_EVENT:
++		c->events++;
++		break;
++	default:
++		break;
++	}
++}
++
++static unsigned
++mbox_poll(void)
++{
++	unsigned got = 0;
++
++	for (;;) {
++		uint32_t sts = rd(mbout, MBOX_FIFO_STS1);
++		uint32_t w = (sts >> 16) & 0xff, r = (sts >> 24) & 0xff, len;
++		if (w == r) {
++			len = (sts & 4) ? out_depth : 0;
++		} else {
++			len = w > r ? w - r : out_depth - r + w;
++		}
++		if (len == 0) {
++			break;
++		}
++		for (uint32_t i = 0; i < len; i++) {
++			uint32_t lo = rd(mbout, MBOX_MSG_LOW), hi = rd(mbout, MBOX_MSG_HIGH), id = rd(mbout, MBOX_ID);
++			wr(mbout, MBOX_TRIGGER, 1);
++			got++;
++			if (id == MBOX_WCN) {
++				smsg_handle((uint8_t)lo, (uint8_t)(lo >> 8), (uint16_t)(lo >> 16), hi);
++			} else {
++				printf("AGM SIPC: message for core %u dropped (%#x %#x)\n", id, lo, hi);
++			}
++		}
++	}
++	uint32_t irq = rd(mbout, MBOX_IRQ_STS) & 0x1ffff;
++	if (irq) {
++		wr(mbout, MBOX_IRQ_STS, irq);
++	}
++	return got;
++}
++
++/* poll for up to ms milliseconds, or until *cond */
++static void
++pump(unsigned ms, volatile uint8_t *cond)
++{
++	for (unsigned t = 0; t < ms * 2 && !(cond && *cond); t++) {
++		(void)mbox_poll();
++		delay(500);
++	}
++}
++
++static void
++open_channel(int n)
++{
++	(void)mbox_send((uint8_t)n, T_OPEN, OPEN_MAGIC, 0);
++	if (!ch[n].peer_open) {
++		pump(2000, &ch[n].peer_open);
++	}
++	ch[n].open = ch[n].peer_open;
++	printf("AGM SIPC: ch %u open %d\n", n, ch[n].open);
++}
++
++static void
++hexdump(const char *what, vm_offset_t p, uint32_t len)
++{
++	char s[3 * 32 + 1];
++
++	for (uint32_t o = 0; o < len && o < 256; o += 32) {
++		unsigned k = 0;
++		for (uint32_t i = o; i < len && i < o + 32; i++) {
++			k += (unsigned)snprintf(s + k, sizeof(s) - k, "%02x ", *(volatile uint8_t *)(p + i));
++		}
++		printf("AGM WIFI %s +%02x: %s\n", what, o, s);
++	}
++}
++
++static void
++wifi_rx(void)
++{
++	uint32_t a, len;
++
++	while (ch[CH_WIFI_CMD].ready && sblock_receive(&ch[CH_WIFI_CMD], &a, &len)) {
++		vm_offset_t p = cpv(a);
++		uint8_t common = *(volatile uint8_t *)p, id = *(volatile uint8_t *)(p + 1);
++		printf("AGM WIFI rx: %s id %u ctx %u rsp %u len %u (plen %u) status %d\n",
++		    (common & 7) == 0 ? "cmd response" : (common & 7) == 1 ? "event" : "type?", id, common >> 5,
++		    (common >> 4) & 1, len, *(volatile uint16_t *)(p + 2), *(volatile int8_t *)(p + 8));
++		hexdump("rx", p, len);
++		sblock_release(CH_WIFI_CMD, a);
++	}
++}
++
++static void
++wifi_send_sync_version(void)
++{
++	struct chan *c = &ch[CH_WIFI_CMD];
++	uint32_t a = sblock_get(c), plen = 12 + 4 + 256;
++
++	if (a == 0) {
++		printf("AGM WIFI: no free command block\n");
++		return;
++	}
++	vm_offset_t p = cpv(a);
++	for (uint32_t o = 0; o < plen; o += 4) {
++		wr(p, o, 0);
++	}
++	*(volatile uint8_t *)p = (uint8_t)(0 /* cmd */ | 1u << 4 /* rsp */);
++	*(volatile uint8_t *)(p + 1) = WIFI_CMD_SYNC_VERSION;
++	*(volatile uint16_t *)(p + 2) = (uint16_t)plen;
++	*(volatile uint32_t *)(p + 4) = (uint32_t)(mach_absolute_time() / 26000);    /* ms */
++	wr(p, 12, 1);                                   /* main_ver: MAIN_DRV_VERSION */
++	/* api_map: the driver's API versions (api_version.c g_api_array) */
++	static const uint8_t ones[][2] = {
++		{ 0, 41 }, { 56, 80 }, { 82, 82 }, { 84, 85 }, { 91, 91 }, { 128, 134 }, { 136, 137 },
++		{ 160, 161 }, { 176, 179 }, { 224, 225 }, { 242, 248 },
++	};
++	for (unsigned r = 0; r < sizeof(ones) / sizeof(ones[0]); r++) {
++		for (unsigned k = ones[r][0]; k <= ones[r][1]; k++) {
++			*(volatile uint8_t *)(p + 16 + k) = 1;
++		}
++	}
++	*(volatile uint8_t *)(p + 16 + 1) = 2;          /* GET_INFO */
++	*(volatile uint8_t *)(p + 16 + 11) = 3;         /* SCAN */
++	__builtin_arm_dsb(0xf);
++	hexdump("tx", p, 32);
++	sblock_send(CH_WIFI_CMD, a, plen);
++}
++
++void
++agm_wcn_sipc_run(void)
++{
++	mbin = ml_io_map(MBOX_IN_PA, 0x1000);
++	mbout = ml_io_map(MBOX_OUT_PA, 0x1000);
++	smem = ml_io_map_wcomb(SMEM_PA, SMEM_SIZE);
++	if (!mbin || !mbout || !smem) {
++		printf("AGM SIPC: map failed\n");
++		return;
++	}
++	out_depth = rd(mbout, MBOX_FIFO_STS2) + 1;
++	printf("AGM SIPC: mailbox in sts1 %#x sts2 %#x msk %#x; out sts1 %#x msk %#x depth %u\n",
++	    rd(mbin, MBOX_FIFO_STS1), rd(mbin, MBOX_FIFO_STS2), rd(mbin, MBOX_IRQ_MSK),
++	    rd(mbout, MBOX_FIFO_STS1), rd(mbout, MBOX_IRQ_MSK), out_depth);
++	/* what is already waiting (the CP may have spoken first), before any reset */
++	(void)mbox_poll();
++	/* sprd_mbox_phy_startup: outbox in FIFO mode, inbox block/overflow and outbox not-empty interrupts */
++	wr(mbout, MBOX_FIFO_RST, 0);
++	wr(mbin, MBOX_IRQ_MSK, (rd(mbin, MBOX_IRQ_MSK) & ~3u) | 4u);
++	wr(mbout, MBOX_IRQ_MSK, rd(mbout, MBOX_IRQ_MSK) & ~1u);
++	pump(300, NULL);
++
++	if (!sbuf_create(CH_LOG, 0x8000, 0x30000) || !sbuf_create(CH_ASSERT, 0x400, 0x400) ||
++	    !sbuf_create(CH_LOOPCHECK, 0x400, 0x400) || !sblock_create(CH_WIFI_CMD, 4, 2048, 8, 2048)) {
++		printf("AGM SIPC: smem exhausted\n");
++		return;
++	}
++	printf("AGM SIPC: smem used %#x of %#x\n", smem_used, SMEM_SIZE);
++	open_channel(CH_ASSERT);
++	open_channel(CH_LOG);
++	open_channel(CH_LOOPCHECK);
++	open_channel(CH_WIFI_CMD);
++	pump(3000, &ch[CH_WIFI_CMD].ready);
++	printf("AGM SIPC: ready: log %u assert %u loopcheck %u wifi cmd %u\n", ch[CH_LOG].ready, ch[CH_ASSERT].ready,
++	    ch[CH_LOOPCHECK].ready, ch[CH_WIFI_CMD].ready);
++	if (ch[CH_WIFI_CMD].ready) {
++		wifi_send_sync_version();
++	}
++	/* from here on: log, asserts, loopcheck, Wi-Fi command channel, every 2 ms */
++	for (;;) {
++		(void)mbox_poll();
++		if (ch[CH_LOG].ready) {
++			sbuf_drain(CH_LOG, "log");
++		}
++		if (ch[CH_ASSERT].ready) {
++			sbuf_drain(CH_ASSERT, "assert");
++		}
++		if (ch[CH_LOOPCHECK].ready) {
++			sbuf_drain(CH_LOOPCHECK, "loopcheck");
++		}
++		wifi_rx();
++		IOSleep(2);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_AGM */

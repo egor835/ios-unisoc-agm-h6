@@ -1,0 +1,96 @@
+agm-0968: AGM H6 Mali-G57 probe (boot-arg agm_gpu_probe=1): GPU top power domain
+(PMU +0x2c4 bit 25), AON gpu_eb and GPU APB clocks at 26 MHz after the vendor
+qogirl6 platform code, then GPU_ID and the feature/present registers are logged.
+
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index a634033e1..b5c09662f 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -46,6 +46,16 @@
+  * defaults (VOREG differs) the setup is applied again. REG0 STAT bits 5:4
+  * (0 ready, 1 charging, 2 done, 3 fault) feed SweetBattery.
+  *
++ * GPU probe (step 1 of Mali-G57 support): power and clocks after the vendor
++ * platform code (Realme C53 kernel_modules/.../gpu/natt/mali/platform/qogirl6)
++ * and mainline ums9230-clk.c: AON APB gate gpu_eb (0x64000000 bit 11, set reg
++ * +0x1000), PMU 0x64020000 +0x2c4 bit 25 = top force shutdown (clear, then
++ * +0x500 bits 20:16 read 0 when the top domain is on), GPU APB 0x23000000:
++ * +0x0 soft resets (bits 0/1), +0x4 core / +0x8 mem clock (gate bit 0, mux
++ * bits 6:4 with 0 = 26 MHz, div bits 10:8), +0xc sys (gate bit 0, div 6:4).
++ * The Mali registers at 0x23100000 are only read once that is all on:
++ * GPU_ID 0x0, L2/TILER/SHADER features and present masks.
++ *
+  * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
+  * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
+  * Here it is reloaded with AGM_WDT_SECS every AGM_WDT_FEED_SECS, as Linux's
+@@ -498,6 +508,59 @@ agm_charger_status(void)
+ 	return agm_chg_stat;
+ }
+ 
++#define AON_APB_PA		0x64000000UL
++#define PMU_APB_PA		0x64020000UL
++#define GPU_APB_PA		0x23000000UL
++#define MALI_PA			0x23100000UL
++
++static void
++agm_gpu_probe(void)
++{
++	vm_offset_t aon = ml_io_map(AON_APB_PA, 0x2000), pmu = ml_io_map(PMU_APB_PA, 0x1000);
++	vm_offset_t gapb = ml_io_map(GPU_APB_PA, 0x1000), mali;
++	uint32_t st = 0;
++	int i;
++
++	if (aon == 0 || pmu == 0 || gapb == 0) {
++		printf("AGM GPU: map failed\n");
++		return;
++	}
++	printf("AGM GPU: before aon %#x pmu force %#x state %#x\n",
++	    rd32(aon), rd32(pmu + 0x2c4), rd32(pmu + 0x500));
++	wr32(aon + 0x1000, 1u << 11);				/* gpu_eb */
++	wr32(pmu + 0x2c4, rd32(pmu + 0x2c4) & ~(1u << 25));	/* top power on */
++	delay(100);
++	for (i = 0; i < 200 && ((st = rd32(pmu + 0x500)) & (0x1fu << 16)); i++) {
++		delay(50);
++	}
++	printf("AGM GPU: top power %s (state %#x, %d polls), gpu apb rst %#x core %#x mem %#x sys %#x\n",
++	    (st & (0x1fu << 16)) ? "TIMEOUT" : "on", st, i, rd32(gapb), rd32(gapb + 0x4),
++	    rd32(gapb + 0x8), rd32(gapb + 0xc));
++	if (st & (0x1fu << 16)) {
++		return;
++	}
++	wr32(gapb + 0x4, (rd32(gapb + 0x4) & ~0x770u) | 1u);	/* core: 26 MHz, gate on */
++	wr32(gapb + 0x8, (rd32(gapb + 0x8) & ~0x770u) | 1u);	/* mem: 26 MHz, gate on */
++	wr32(gapb + 0xc, (rd32(gapb + 0xc) & ~0x070u) | 1u);	/* sys: gate on */
++	delay(200);
++	if (rd32(gapb) & 3u) {
++		wr32(gapb, rd32(gapb) & ~3u);			/* release soft resets */
++		delay(10);
++	}
++	printf("AGM GPU: clocks core %#x mem %#x sys %#x rst %#x\n",
++	    rd32(gapb + 0x4), rd32(gapb + 0x8), rd32(gapb + 0xc), rd32(gapb));
++	mali = ml_io_map(MALI_PA, 0x4000);
++	if (mali == 0) {
++		return;
++	}
++	printf("AGM GPU: GPU_ID %#x L2 %#x TILER %#x MEM %#x MMU %#x AS %#x JS %#x\n",
++	    rd32(mali + 0x0), rd32(mali + 0x4), rd32(mali + 0xc), rd32(mali + 0x10),
++	    rd32(mali + 0x14), rd32(mali + 0x18), rd32(mali + 0x1c));
++	printf("AGM GPU: shader present %#x tiler %#x l2 %#x, thread max %#x, coherency %#x\n",
++	    rd32(mali + 0x100), rd32(mali + 0x110), rd32(mali + 0x120), rd32(mali + 0xa0),
++	    rd32(mali + 0x300));
++}
++
+ static void
+ agm_gpio_input(unsigned n)
+ {
+@@ -736,6 +799,10 @@ agm_keys_init(void)
+ 			agm_chg_poll();
+ 		}
+ 	}
++	if (PE_parse_boot_argn("agm_gpu_probe", &dmsk, sizeof(dmsk)) && dmsk != 0) {
++		agm_gpu_probe();
++	}
++	dmsk = 0;
+ 	if (pmic_read(EIC_DMSK, &dmsk)) {
+ 		pmic_write(EIC_DMSK, dmsk | (1u << EIC_POWER) | (1u << EIC_VOLUP));
+ 	}

@@ -1,0 +1,259 @@
+agm-0964: AGM H6 keys and PMIC watchdog feeding (bsd/dev/agm_keys.c): Volume
+Down on AP GPIO 124, Power and Volume Up on SC2730 EIC 1/4 over the ADI bus, polled
+every 20 ms into sweet_hid_key(); the SC2730 watchdog is reloaded for 10 minutes
+every minute.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864abf3..48543a685 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/topaz_sta.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
++bsd/dev/agm_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+new file mode 100644
+index 000000000..92a653067
+--- /dev/null
++++ b/bsd/dev/agm_keys.c
+@@ -0,0 +1,223 @@
++/*
++ * AGM H6 (Unisoc UMS9230 + SC2730 PMIC): polled keys and PMIC watchdog feeding.
++ *
++ * Keys (live FDT gpio-keys):
++ *   Volume Down  AP GPIO 124, active low   (ap_gpio @0x641b0000, sprd,sc9860-gpio)
++ *   Power        PMIC EIC 1,  active low   (pmic_eic @0x280 in the SC2730)
++ *   Volume Up    PMIC EIC 4,  active high
++ * AP GPIO registers per 16-line bank (stride 0x80): DATA 0x0, DMSK 0x4, DIR 0x8,
++ * INEN 0x28 (vendor gpio-sprd.c). PMIC EIC: DATA 0x0, DMSK 0x4 (gpio-pmic-eic-sprd.c).
++ *
++ * SC2730 registers go through the ADI bus (vendor spi-sprd-adi.c, sharkl5pro
++ * variant): window = 0x64200000 + 0x20000; read: physical address -> RD_CMD
++ * (+0x28), poll RD_DATA (+0x2c) until bit 31 clears, bits 30:16 echo the
++ * address >> 2; write: store into the window once the write FIFO (+0x30,
++ * bit 10 empty, bit 11 full) has room. This thread is the only ADI user in xnu.
++ *
++ * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
++ * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
++ * Here it is reloaded with AGM_WDT_SECS every AGM_WDT_FEED_SECS, as Linux's
++ * watchdog drivers do: it never fires while xnu runs, and a hung kernel still
++ * resets the phone (back to slot A) AGM_WDT_SECS later.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void agm_keys_init(void);
++
++#define ADI_PA			0x64200000UL
++#define ADI_SIZE		0x30000
++#define ADI_RD_CMD		0x28
++#define ADI_RD_DATA		0x2c
++#define ADI_FIFO_STS		0x30
++#define ADI_SLAVE		0x20000
++#define ADI_RD_BUSY		(1u << 31)
++#define ADI_FIFO_EMPTY		(1u << 10)
++#define ADI_FIFO_FULL		(1u << 11)
++
++#define GPIO_PA			0x641b0000UL
++#define GPIO_SIZE		0x10000
++#define GPIO_DATA		0x0
++#define GPIO_DMSK		0x4
++#define GPIO_DIR		0x8
++#define GPIO_INEN		0x28
++#define GPIO_VOLDOWN		124
++
++#define EIC			0x280		/* SC2730 EIC */
++#define EIC_DATA		(EIC + 0x0)
++#define EIC_DMSK		(EIC + 0x4)
++#define EIC_POWER		1
++#define EIC_VOLUP		4
++
++#define WDT			0x40		/* SC2730 watchdog */
++#define WDT_LOAD_LOW		(WDT + 0x00)
++#define WDT_LOAD_HIGH		(WDT + 0x04)
++#define WDT_INT_RAW		(WDT + 0x10)
++#define WDT_LOCK		(WDT + 0x20)
++#define WDT_LD_BUSY		(1u << 4)
++#define WDT_UNLOCK_KEY		0xe551
++#define WDT_HZ			32768u
++#define AGM_WDT_SECS		600
++#define AGM_WDT_FEED_SECS	60
++
++#define KEYS_POLL_MS		20
++
++static vm_offset_t agm_adi, agm_gpio;
++static int agm_keys_chan;
++
++static inline uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static bool
++pmic_read(uint32_t reg, uint32_t *val)
++{
++	uint32_t paddr = (uint32_t)(ADI_PA + ADI_SLAVE + reg), v = ADI_RD_BUSY;
++
++	wr32(agm_adi + ADI_RD_CMD, paddr);
++	for (int i = 0; i < 100000 && (v & ADI_RD_BUSY); i++) {
++		v = rd32(agm_adi + ADI_RD_DATA);
++	}
++	if ((v & ADI_RD_BUSY) || ((v >> 16) & 0x7fff) != ((paddr & 0x1ffff) >> 2)) {
++		return false;
++	}
++	*val = v & 0xffff;
++	return true;
++}
++
++static bool
++pmic_write(uint32_t reg, uint32_t val)
++{
++	int i;
++
++	for (i = 0; i < 100000 && !(rd32(agm_adi + ADI_FIFO_STS) & ADI_FIFO_EMPTY); i++) {
++		;
++	}
++	if (rd32(agm_adi + ADI_FIFO_STS) & ADI_FIFO_FULL) {
++		return false;
++	}
++	wr32(agm_adi + ADI_SLAVE + reg, val & 0xffff);
++	return true;
++}
++
++static void
++agm_wdt_feed(void)
++{
++	uint32_t load = AGM_WDT_SECS * WDT_HZ, raw = 0;
++
++	pmic_write(WDT_LOCK, WDT_UNLOCK_KEY);
++	for (int i = 0; i < 1000 && pmic_read(WDT_INT_RAW, &raw) && (raw & WDT_LD_BUSY); i++) {
++		delay(10);
++	}
++	pmic_write(WDT_LOAD_HIGH, load >> 16);
++	pmic_write(WDT_LOAD_LOW, load & 0xffff);
++	pmic_write(WDT_LOCK, (~WDT_UNLOCK_KEY) & 0xffff);
++}
++
++static void
++agm_gpio_input(unsigned n)
++{
++	vm_offset_t b = agm_gpio + (n >> 4) * 0x80;
++	uint32_t bit = 1u << (n & 15);
++
++	wr32(b + GPIO_DMSK, rd32(b + GPIO_DMSK) | bit);
++	wr32(b + GPIO_DIR, rd32(b + GPIO_DIR) & ~bit);
++	wr32(b + GPIO_INEN, rd32(b + GPIO_INEN) | bit);
++}
++
++static int
++agm_gpio_get(unsigned n)
++{
++	return (rd32(agm_gpio + (n >> 4) * 0x80 + GPIO_DATA) >> (n & 15)) & 1;
++}
++
++static void
++agm_keys_wait(void)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(KEYS_POLL_MS, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&agm_keys_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++agm_keys_thread(void *arg, wait_result_t result)
++{
++	/* sweet_hid_key: 0 power, 1 volume up, 2 volume down */
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0, ticks = 0;
++	(void)arg;
++	(void)result;
++
++	agm_wdt_feed();
++	for (;;) {
++		uint32_t eic = 0;
++		bool eok = pmic_read(EIC_DATA, &eic);
++		int now[3] = {
++			!(eic & (1u << EIC_POWER)),
++			!!(eic & (1u << EIC_VOLUP)),
++			!agm_gpio_get(GPIO_VOLDOWN),
++		};
++
++		if (!eok && (errors++ % 250u) == 0) {
++			printf("AGM KEYS: PMIC EIC read error\n");
++		}
++		for (int k = 0; k < 3; k++) {
++			if ((k == 2 || eok) && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("AGM KEYS: key=%d down=%d eic=%#x\n", k, state[k], eic);
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		if (++ticks >= AGM_WDT_FEED_SECS * 1000 / KEYS_POLL_MS) {
++			ticks = 0;
++			agm_wdt_feed();
++		}
++		agm_keys_wait();
++	}
++}
++
++void
++agm_keys_init(void)
++{
++	thread_t thread;
++	uint32_t dmsk = 0, eic = 0;
++
++	agm_adi = ml_io_map(ADI_PA, ADI_SIZE);
++	agm_gpio = ml_io_map(GPIO_PA, GPIO_SIZE);
++	if (agm_adi == 0 || agm_gpio == 0) {
++		printf("AGM KEYS: MMIO map failed\n");
++		return;
++	}
++	agm_gpio_input(GPIO_VOLDOWN);
++	if (pmic_read(EIC_DMSK, &dmsk)) {
++		pmic_write(EIC_DMSK, dmsk | (1u << EIC_POWER) | (1u << EIC_VOLUP));
++	}
++	bool eok = pmic_read(EIC_DATA, &eic);
++	printf("AGM KEYS: eic dmsk %#x data %#x (%s), voldown gpio %d; watchdog fed every %d s for %d s\n",
++	    dmsk, eic, eok ? "ok" : "read error", agm_gpio_get(GPIO_VOLDOWN), AGM_WDT_FEED_SECS, AGM_WDT_SECS);
++	kern_return_t kr = kernel_thread_start(agm_keys_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("AGM KEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_AGM */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b0ebfff27..a30221b23 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -821,6 +821,8 @@ sweet_ufs_init(void)
+ 	 */
+ #if defined(SWEET_AGM)
+ 	printf("SWEET UFS: touch/keys/USB skipped (AGM H6: no Qualcomm QUP/SPMI/DWC3)\n");
++	extern void agm_keys_init(void);
++	agm_keys_init();
+ #else
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));

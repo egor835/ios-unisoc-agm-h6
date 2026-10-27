@@ -1,0 +1,332 @@
+agm-0967: AGM H6 charging: polled I2C5 driver and ETA6937 charger setup
+(safety 4.40 V / 1.55 A, charge 1.15 A to 4.40 V, input limit 1.5 A,
+termination on, PMIC charger_pd cleared), charger watchdog fed every 10 s and
+settings re-applied after a chip reset; SweetBattery reports external power,
+charging and full from the charger status.
+
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index 501fecf51..a634033e1 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -32,6 +32,20 @@
+  * seconds since 1970). The ADI is shared by the input thread, the battery
+  * poll and halt/restart, hence agm_adi_lock.
+  *
++ * Charger: ETA6937 (bq24157-like) at 0x6a on I2C5 (sprd,sc9860-i2c @0x20210000,
++ * gate AP APB bit 26, clock mux/div at AP clk +0x44, 26 MHz source), driven
++ * polled at 100 kHz like the vendor i2c-sprd.c does with interrupts: reset the
++ * FIFO, ADDR_CFG = addr << 1, COUNT, CTL.MODE (read) / CTL.STP_EN (no stop
++ * before a repeated start), TX bytes, CTL.START, wait for STATUS.INT, then
++ * STATUS.RX_ACK set = NACK. Setup follows eta6937-charger.c hw_init with this
++ * phone's battery node (4.40 V max, 4900 mAh): safety VMREG 4.40 V / IMCHRG
++ * 1.55 A first, charge 1.15 A, VOREG 4.40 V, input limit 2 = 1.5 A (VINDPM
++ * protects weak sources), termination enabled (Linux leaves it to the charger
++ * manager instead), PMIC charger_pd (0x1b98 bit 0) cleared. The chip's 32 s
++ * host watchdog is fed every CHG_POLL_SECS; when it has fallen back to its
++ * defaults (VOREG differs) the setup is applied again. REG0 STAT bits 5:4
++ * (0 ready, 1 charging, 2 done, 3 fault) feed SweetBattery.
++ *
+  * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
+  * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
+  * Here it is reloaded with AGM_WDT_SECS every AGM_WDT_FEED_SECS, as Linux's
+@@ -137,9 +151,47 @@ LCK_SPIN_DECLARE(agm_adi_lock, &agm_lck_grp);
+ #define FGU_VOL_1000MV_ADC	691
+ #define FGU_CUR_1000MA_ADC	680
+ #define RTC			0x200
++#define PMIC_CHGR_PD		0x1b98		/* bit 0: charger disabled */
++#define PMIC_CHGR_DET		0x1ba0
++
++#define I2C_PA			0x20210000UL	/* I2C5 */
++#define I2C_CTL			0x00
++#define I2C_ADDR_CFG		0x04
++#define I2C_COUNT		0x08
++#define I2C_RX			0x0c
++#define I2C_TX			0x10
++#define I2C_STATUS		0x14
++#define I2C_DVD0		0x20
++#define I2C_DVD1		0x24
++#define I2C_STA0_DVD		0x28
++#define I2C_RST			0x2c
++#define I2C_CTL_NACK_EN		(1u << 22)
++#define I2C_CTL_TRANS_EN	(1u << 21)
++#define I2C_CTL_STP_EN		(1u << 20)
++#define I2C_CTL_FULL_INTEN	(1u << 10)
++#define I2C_CTL_EMPTY_INTEN	(1u << 9)
++#define I2C_CTL_DVD_OPT		(1u << 8)
++#define I2C_CTL_MODE		(1u << 3)
++#define I2C_CTL_EN		(1u << 2)
++#define I2C_CTL_INT_EN		(1u << 1)
++#define I2C_CTL_START		(1u << 0)
++#define I2C_ST_INT		(1u << 2)
++#define I2C_ST_RX_ACK		(1u << 1)	/* set: no ACK from the slave */
++#define I2C_FIFO		12
++
++#define CHG_ADDR		0x6a
++#define CHG_POLL_SECS		10
++#define CHG_VOREG		45u		/* REG2 bits 7:2: 3500 + 45 * 20 = 4400 mV */
++#define CHG_ICHG		6u		/* REG4 6:4 + REG5 7:6: 550 + 6 * 100 = 1150 mA */
++#define CHG_SAFETY		((5u << 4) | 10u)	/* REG6: IMCHRG 550 + 5 * 200 = 1550 mA, VMREG 4200 + 10 * 20 = 4400 mV */
++#define CHG_IIN_LIM2		4u		/* REG7 2:0: 300/500/800/1200/1500 mA */
+ 
+ extern int (*PE_halt_restart)(unsigned int type);
+ int agm_battery_read(int *mv, int *ma);
++int agm_charger_status(void);
++
++static vm_offset_t agm_i2c;
++static int agm_chg_stat = -1;		/* ETA6937 REG0 STAT, -1 unknown */
+ 
+ static bool
+ agm_pmic_map(void)
+@@ -278,6 +330,174 @@ agm_wdt_feed(void)
+ 	pmic_write(WDT_LOCK, (~WDT_UNLOCK_KEY) & 0xffff);
+ }
+ 
++static bool
++i2c_init(void)
++{
++	vm_offset_t apb = ml_io_map(APB_PA, 0x2000), apclk = ml_io_map(APCLK_PA, 0x1000);
++
++	agm_i2c = ml_io_map(I2C_PA, 0x1000);
++	if (apb == 0 || apclk == 0 || agm_i2c == 0) {
++		agm_i2c = 0;
++		return false;
++	}
++	wr32(apb + 0x1000, 1u << 26);				/* I2C5 clock gate on */
++	wr32(apclk + 0x44, rd32(apclk + 0x44) & ~0x703u);	/* 26 MHz source, no divider */
++	delay(10);
++	wr32(agm_i2c + I2C_CTL, I2C_CTL_DVD_OPT | (15u << 16) | (4u << 12));	/* FIFO thresholds as Linux */
++	/* 100 kHz: prescale 26 MHz / (4 * 100 kHz) - 1 = 64, SCL high 2/5, low 3/5 */
++	wr32(agm_i2c + I2C_DVD0, (51u << 16) | 76u);
++	wr32(agm_i2c + I2C_DVD1, 0);
++	wr32(agm_i2c + I2C_STA0_DVD, 104);			/* 4 us start hold */
++	wr32(agm_i2c + I2C_RST, 1);
++	wr32(agm_i2c + I2C_STATUS, rd32(agm_i2c + I2C_STATUS) & ~I2C_ST_INT);
++	wr32(agm_i2c + I2C_CTL, rd32(agm_i2c + I2C_CTL) | I2C_CTL_EN | I2C_CTL_INT_EN |
++	    I2C_CTL_NACK_EN | I2C_CTL_TRANS_EN);
++	return true;
++}
++
++/* One I2C message of at most I2C_FIFO bytes; last = end with a stop. */
++static bool
++i2c_msg(uint8_t addr, bool rd, uint8_t *buf, unsigned len, bool last)
++{
++	vm_offset_t b = agm_i2c;
++	uint32_t ctl, st = 0;
++	int i;
++
++	if (b == 0 || len == 0 || len > I2C_FIFO) {
++		return false;
++	}
++	wr32(b + I2C_RST, 1);
++	wr32(b + I2C_ADDR_CFG, (uint32_t)addr << 1);
++	wr32(b + I2C_COUNT, len);
++	ctl = rd32(b + I2C_CTL) & ~(I2C_CTL_MODE | I2C_CTL_STP_EN | I2C_CTL_FULL_INTEN |
++	    I2C_CTL_EMPTY_INTEN | I2C_CTL_START);
++	if (rd) {
++		ctl |= I2C_CTL_MODE;
++	} else if (!last) {
++		ctl |= I2C_CTL_STP_EN;		/* hold the bus for a repeated start */
++	}
++	wr32(b + I2C_CTL, ctl);
++	if (!rd) {
++		for (unsigned n = 0; n < len; n++) {
++			*(volatile uint8_t *)(b + I2C_TX) = buf[n];
++		}
++	}
++	wr32(b + I2C_CTL, ctl | I2C_CTL_START);
++	for (i = 0; i < 10000 && !((st = rd32(b + I2C_STATUS)) & I2C_ST_INT); i++) {
++		delay(1);
++	}
++	bool ok = (st & I2C_ST_INT) && !(st & I2C_ST_RX_ACK);
++	if (ok && rd) {
++		for (unsigned n = 0; n < len; n++) {
++			buf[n] = *(volatile uint8_t *)(b + I2C_RX);
++		}
++	}
++	wr32(b + I2C_CTL, rd32(b + I2C_CTL) & ~I2C_CTL_START);
++	wr32(b + I2C_STATUS, rd32(b + I2C_STATUS) & ~(I2C_ST_INT | I2C_ST_RX_ACK));
++	return ok;
++}
++
++static int
++chg_read(uint8_t reg)
++{
++	uint8_t v = 0;
++
++	if (!i2c_msg(CHG_ADDR, false, &reg, 1, false) || !i2c_msg(CHG_ADDR, true, &v, 1, true)) {
++		return -1;
++	}
++	return v;
++}
++
++static bool
++chg_write(uint8_t reg, uint8_t val)
++{
++	uint8_t b[2] = { reg, val };
++
++	return i2c_msg(CHG_ADDR, false, b, 2, true);
++}
++
++static bool
++chg_update(uint8_t reg, uint8_t mask, uint8_t val)
++{
++	int v = chg_read(reg);
++
++	if (v < 0) {
++		return false;
++	}
++	if (reg == 4) {
++		v &= ~0x80;			/* REG4 bit 7 = RESET, never write it back */
++	}
++	return chg_write(reg, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++static void
++chg_dump(const char *when)
++{
++	int r[8];
++
++	for (int i = 0; i < 8; i++) {
++		r[i] = chg_read((uint8_t)i);
++	}
++	printf("AGM CHG %s: %02x %02x %02x %02x %02x %02x %02x %02x\n", when,
++	    r[0] & 0x1ff, r[1] & 0x1ff, r[2] & 0x1ff, r[3] & 0x1ff, r[4] & 0x1ff, r[5] & 0x1ff,
++	    r[6] & 0x1ff, r[7] & 0x1ff);
++}
++
++/* eta6937-charger.c hw_init order: safety register first, then the rest. */
++static bool
++agm_chg_setup(void)
++{
++	bool ok = chg_write(6, CHG_SAFETY) &&
++	    chg_update(5, 0xe0, (uint8_t)((CHG_ICHG >> 3) << 6)) &&		/* ICHG[4:3], LOW_CHG off */
++	    chg_update(1, 0x3f, 1u << 3) &&					/* VLOWV 3.4 V, TE on, nCE 0, HZ 0, charge */
++	    chg_update(4, 0x78, (uint8_t)((CHG_ICHG & 7) << 4)) &&		/* ICHG[2:0], ICHG_OFFSET 0 */
++	    chg_update(2, 0xff, (uint8_t)(CHG_VOREG << 2)) &&			/* VOREG, OTG off */
++	    chg_write(0, 0x80) &&						/* TMR_RST */
++	    chg_update(7, 0x0f, (uint8_t)((1u << 3) | CHG_IIN_LIM2));		/* EN_ILIM_2, input limit */
++	uint32_t pd = 0;
++
++	if (pmic_read(PMIC_CHGR_PD, &pd) && (pd & 1u)) {
++		pmic_write(PMIC_CHGR_PD, pd & ~1u);
++	}
++	return ok;
++}
++
++/* Every CHG_POLL_SECS from the input thread: feed, check, re-apply, read status. */
++static void
++agm_chg_poll(void)
++{
++	static unsigned errors;
++	int r0, r2;
++
++	if (!chg_write(0, 0x80) || (r0 = chg_read(0)) < 0 || (r2 = chg_read(2)) < 0) {
++		if (errors++ % 30 == 0) {
++			printf("AGM CHG: I2C error\n");
++		}
++		agm_chg_stat = -1;
++		return;
++	}
++	if ((r2 >> 2) != CHG_VOREG) {
++		bool ok = agm_chg_setup();
++		chg_dump(ok ? "re-applied" : "re-apply failed");
++	}
++	int stat = (r0 >> 4) & 3;
++	if (stat != agm_chg_stat) {
++		uint32_t pd = 0, det = 0;
++		pmic_read(PMIC_CHGR_PD, &pd);
++		pmic_read(PMIC_CHGR_DET, &det);
++		printf("AGM CHG: status %d -> %d (reg0 %#x fault %d, pmic pd %#x det %#x)\n",
++		    agm_chg_stat, stat, r0, r0 & 7, pd, det);
++		agm_chg_stat = stat;
++	}
++}
++
++/* For SweetBattery: 0 ready (no input), 1 charging, 2 done, 3 fault, -1 unknown. */
++int
++agm_charger_status(void)
++{
++	return agm_chg_stat;
++}
++
+ static void
+ agm_gpio_input(unsigned n)
+ {
+@@ -437,7 +657,7 @@ agm_keys_thread(void *arg, wait_result_t result)
+ {
+ 	/* sweet_hid_key: 0 power, 1 volume up, 2 volume down */
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0, ticks = 0, ts_errors = 0;
++	unsigned errors = 0, ticks = 0, chg_ticks = 0, ts_errors = 0;
+ 	bool ts_down[TS_FINGERS] = { false };
+ 	(void)arg;
+ 	(void)result;
+@@ -465,6 +685,10 @@ agm_keys_thread(void *arg, wait_result_t result)
+ 		if (agm_spi != 0) {
+ 			ts_poll(ts_down, &ts_errors);
+ 		}
++		if (agm_i2c != 0 && ++chg_ticks >= CHG_POLL_SECS * 1000 / KEYS_POLL_MS) {
++			chg_ticks = 0;
++			agm_chg_poll();
++		}
+ 		if (++ticks >= AGM_WDT_FEED_SECS * 1000 / KEYS_POLL_MS) {
+ 			ticks = 0;
+ 			agm_wdt_feed();
+@@ -495,6 +719,23 @@ agm_keys_init(void)
+ 		uint8_t rx[TS_XFER_SIZE];
+ 		printf("AGM TOUCH: ICNL9916 on SPI3, first read %d\n", ts_read(rx));
+ 	}
++	if (!i2c_init()) {
++		printf("AGM CHG: I2C5 map failed\n");
++	} else {
++		uint32_t pd = 0, det = 0;
++		pmic_read(PMIC_CHGR_PD, &pd);
++		pmic_read(PMIC_CHGR_DET, &det);
++		printf("AGM CHG: pmic pd %#x det %#x\n", pd, det);
++		chg_dump("before");
++		if (chg_read(3) < 0) {
++			printf("AGM CHG: ETA6937 not answering, charger left alone\n");
++			agm_i2c = 0;
++		} else {
++			bool ok = agm_chg_setup();
++			chg_dump(ok ? "after" : "setup failed");
++			agm_chg_poll();
++		}
++	}
+ 	if (pmic_read(EIC_DMSK, &dmsk)) {
+ 		pmic_write(EIC_DMSK, dmsk | (1u << EIC_POWER) | (1u << EIC_VOLUP));
+ 	}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index a0cda2117..59d057b81 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #if defined(SWEET_AGM)
+ extern "C" int agm_battery_read(int *mv, int *ma);
++extern "C" int agm_charger_status(void);
+ #endif
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+@@ -380,12 +381,16 @@ SweetBattery::poll(void)
+ 		static unsigned agm_logs;
+ 		int mv = 0, ma = 0;
+ 		if (agm_battery_read(&mv, &ma) == 0 && mv >= 2800 && mv <= 4600) {
+-			bool charging = ma > 10;
+-			unsigned percent = estimatePercent((unsigned)mv);
+-			publish(percent, (unsigned)mv, ma, charging, charging, charging,
+-			    false, true, true);
++			/* ETA6937 STAT: 0 ready (no input), 1 charging, 2 done, 3 fault */
++			int stat = agm_charger_status();
++			bool external = stat > 0 || (stat < 0 && ma > 10);
++			bool charging = stat == 1 || (stat < 0 && ma > 10);
++			bool full = stat == 2;
++			unsigned percent = full ? 100 : estimatePercent((unsigned)mv);
++			publish(percent, (unsigned)mv, ma, external, external, charging,
++			    full, true, true);
+ 			if (agm_logs++ % 30 == 0) {
+-				IOLog("SWEET BATTERY: AGM %u%% %d mV %d mA charging=%d\n", percent, mv, ma, charging);
++				IOLog("SWEET BATTERY: AGM %u%% %d mV %d mA chg=%d charging=%d\n", percent, mv, ma, stat, charging);
+ 			}
+ 			return;
+ 		}

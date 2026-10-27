@@ -1,0 +1,247 @@
+agm-0966: AGM H6 PMIC services: restart and power off through the SC2730
+(PE_halt_restart), calendar from the PMIC RTC, and the SC2730 fuel gauge for
+SweetBattery (voltage -> percent, current -> charging) instead of the static
+fallback.
+
+diff --git a/bsd/dev/agm_keys.c b/bsd/dev/agm_keys.c
+index 6bd088fd3..501fecf51 100644
+--- a/bsd/dev/agm_keys.c
++++ b/bsd/dev/agm_keys.c
+@@ -22,6 +22,16 @@
+  * Probed from the shim: FW ID 0x9916, resolution 720x1612. SweetHIDTouch takes
+  * topaz panel pixels (1080x2400), so coordinates are scaled to that.
+  *
++ * Also on the PMIC (vendor drivers): restart (spi-sprd-adi.c: RST_STATUS 0x1bac
++ * low byte = boot mode, SWRST_CTRL0 0x1bf8 |= bit 4, SOFT_RST_HW 0x1824 |= bit 0),
++ * power off (sc27xx-poweroff.c: SLP_CTRL 0x1a48 &= ~(bit2|bit0), PWR_PD_HW
++ * 0x1820 = 1), the fuel gauge (sc27xx_fuel_gauge.c: FGU 0xc00, VOLTAGE +0x20,
++ * CURRENT +0x2c around 8192; calibration from this phone's PMIC eFuse byte 6:
++ * 0x123 -> vol_1000mv_adc 691, cur_1000ma_adc 680 with the DT 4917 uOhm sense
++ * resistor) and the RTC (rtc-sc27xx.c: base 0x200, sec/min/hour/day counters,
++ * seconds since 1970). The ADI is shared by the input thread, the battery
++ * poll and halt/restart, hence agm_adi_lock.
++ *
+  * Watchdog: the bootloader arms the SC2730 watchdog (base 0x40) for 5 minutes
+  * and on Android the CM4 takes it over; the shim reloads it for 40 minutes.
+  * Here it is reloaded with AGM_WDT_SECS every AGM_WDT_FEED_SECS, as Linux's
+@@ -32,6 +42,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -110,6 +121,34 @@ void agm_keys_init(void);
+ #define TS_CMD_COORDS		0x4103
+ 
+ static vm_offset_t agm_adi, agm_gpio, agm_spi;
++LCK_GRP_DECLARE(agm_lck_grp, "agm");
++LCK_SPIN_DECLARE(agm_adi_lock, &agm_lck_grp);
++
++#define PMIC_RST_STATUS		0x1bac
++#define PMIC_SWRST_CTRL0	0x1bf8
++#define PMIC_SOFT_RST_HW	0x1824
++#define PMIC_SLP_CTRL		0x1a48
++#define PMIC_PWR_PD_HW		0x1820
++#define HWRST_STATUS_NORMAL	0x40
++#define FGU			0xc00
++#define FGU_VOLTAGE		(FGU + 0x20)
++#define FGU_CURRENT		(FGU + 0x2c)
++#define FGU_CUR_BASIC_ADC	8192
++#define FGU_VOL_1000MV_ADC	691
++#define FGU_CUR_1000MA_ADC	680
++#define RTC			0x200
++
++extern int (*PE_halt_restart)(unsigned int type);
++int agm_battery_read(int *mv, int *ma);
++
++static bool
++agm_pmic_map(void)
++{
++	if (agm_adi == 0) {
++		agm_adi = ml_io_map(ADI_PA, ADI_SIZE);
++	}
++	return agm_adi != 0;
++}
+ static int agm_keys_chan;
+ 
+ static inline uint32_t
+@@ -129,10 +168,12 @@ pmic_read(uint32_t reg, uint32_t *val)
+ {
+ 	uint32_t paddr = (uint32_t)(ADI_PA + ADI_SLAVE + reg), v = ADI_RD_BUSY;
+ 
++	lck_spin_lock(&agm_adi_lock);
+ 	wr32(agm_adi + ADI_RD_CMD, paddr);
+ 	for (int i = 0; i < 100000 && (v & ADI_RD_BUSY); i++) {
+ 		v = rd32(agm_adi + ADI_RD_DATA);
+ 	}
++	lck_spin_unlock(&agm_adi_lock);
+ 	if ((v & ADI_RD_BUSY) || ((v >> 16) & 0x7fff) != ((paddr & 0x1ffff) >> 2)) {
+ 		return false;
+ 	}
+@@ -143,16 +184,84 @@ pmic_read(uint32_t reg, uint32_t *val)
+ static bool
+ pmic_write(uint32_t reg, uint32_t val)
+ {
++	bool ok = false;
+ 	int i;
+ 
++	lck_spin_lock(&agm_adi_lock);
+ 	for (i = 0; i < 100000 && !(rd32(agm_adi + ADI_FIFO_STS) & ADI_FIFO_EMPTY); i++) {
+ 		;
+ 	}
+-	if (rd32(agm_adi + ADI_FIFO_STS) & ADI_FIFO_FULL) {
+-		return false;
++	if (!(rd32(agm_adi + ADI_FIFO_STS) & ADI_FIFO_FULL)) {
++		wr32(agm_adi + ADI_SLAVE + reg, val & 0xffff);
++		ok = true;
++	}
++	lck_spin_unlock(&agm_adi_lock);
++	return ok;
++}
++
++/* For SweetBattery: battery voltage (mV) and current (mA, positive = charging). */
++int
++agm_battery_read(int *mv, int *ma)
++{
++	uint32_t v = 0, c = 0;
++
++	if (!agm_pmic_map() || !pmic_read(FGU_VOLTAGE, &v) || !pmic_read(FGU_CURRENT, &c)) {
++		return -1;
++	}
++	*mv = (int)((v * 1000 + FGU_VOL_1000MV_ADC / 2) / FGU_VOL_1000MV_ADC);
++	*ma = ((int)c - FGU_CUR_BASIC_ADC) * 1000 / FGU_CUR_1000MA_ADC;
++	return 0;
++}
++
++/* PEHaltRestart(): power off / restart through the PMIC; panics are left alone. */
++static int
++agm_halt_restart(unsigned int type)
++{
++	uint32_t v = 0;
++
++	if (type == 0) {                /* kPEHaltCPU */
++		printf("AGM: PMIC power off\n");
++		if (pmic_read(PMIC_SLP_CTRL, &v)) {
++			pmic_write(PMIC_SLP_CTRL, v & ~((1u << 2) | (1u << 0)));
++		}
++		pmic_write(PMIC_PWR_PD_HW, 1);
++	} else if (type == 1) {         /* kPERestartCPU */
++		printf("AGM: PMIC restart\n");
++		if (pmic_read(PMIC_RST_STATUS, &v)) {
++			pmic_write(PMIC_RST_STATUS, (v & ~0xffu) | HWRST_STATUS_NORMAL);
++		}
++		if (pmic_read(PMIC_SWRST_CTRL0, &v)) {
++			pmic_write(PMIC_SWRST_CTRL0, v | (1u << 4));
++		}
++		if (pmic_read(PMIC_SOFT_RST_HW, &v)) {
++			pmic_write(PMIC_SOFT_RST_HW, v | 1u);
++		}
++	} else {
++		return -1;
++	}
++	delay(1000000);
++	printf("AGM: PMIC halt/restart had no effect\n");
++	return -1;
++}
++
++/* Calendar from the PMIC RTC (seconds since 1970), like settimeofday(). */
++static void
++agm_rtc_set_calendar(void)
++{
++	uint32_t s = 0, m = 0, h = 0, d = 0, s2 = 0;
++	bool ok = false;
++
++	for (int t = 0; t < 3 && !ok; t++) {
++		ok = pmic_read(RTC + 0x0, &s) && pmic_read(RTC + 0x4, &m) && pmic_read(RTC + 0x8, &h) &&
++		    pmic_read(RTC + 0xc, &d) && pmic_read(RTC + 0x0, &s2) && s == s2;
++	}
++	uint64_t secs = (((uint64_t)(d & 0xffff) * 24 + (h & 0x1f)) * 60 + (m & 0x3f)) * 60 + (s & 0x3f);
++	if (ok && secs > 1600000000ULL) {
++		clock_set_calendar_microtime((clock_sec_t)secs, 0);
++		printf("AGM RTC: calendar set to %llu\n", secs);
++	} else {
++		printf("AGM RTC: no valid time (ok %d, %llu)\n", ok, secs);
+ 	}
+-	wr32(agm_adi + ADI_SLAVE + reg, val & 0xffff);
+-	return true;
+ }
+ 
+ static void
+@@ -370,13 +479,15 @@ agm_keys_init(void)
+ 	thread_t thread;
+ 	uint32_t dmsk = 0, eic = 0;
+ 
+-	agm_adi = ml_io_map(ADI_PA, ADI_SIZE);
++	agm_pmic_map();
+ 	agm_gpio = ml_io_map(GPIO_PA, GPIO_SIZE);
+ 	if (agm_adi == 0 || agm_gpio == 0) {
+ 		printf("AGM KEYS: MMIO map failed\n");
+ 		return;
+ 	}
+ 	agm_gpio_input(GPIO_VOLDOWN);
++	agm_rtc_set_calendar();
++	PE_halt_restart = agm_halt_restart;
+ 	if (!ts_spi_init()) {
+ 		agm_spi = 0;
+ 		printf("AGM TOUCH: SPI3 map failed\n");
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index a6a988d0b..a0cda2117 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -5,6 +5,9 @@
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(SWEET_AGM)
++extern "C" int agm_battery_read(int *mv, int *ma);
++#endif
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -372,6 +375,22 @@ SweetBattery::pollTopaz(void)
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(SWEET_AGM)
++	if (fReal) {
++		static unsigned agm_logs;
++		int mv = 0, ma = 0;
++		if (agm_battery_read(&mv, &ma) == 0 && mv >= 2800 && mv <= 4600) {
++			bool charging = ma > 10;
++			unsigned percent = estimatePercent((unsigned)mv);
++			publish(percent, (unsigned)mv, ma, charging, charging, charging,
++			    false, true, true);
++			if (agm_logs++ % 30 == 0) {
++				IOLog("SWEET BATTERY: AGM %u%% %d mV %d mA charging=%d\n", percent, mv, ma, charging);
++			}
++			return;
++		}
++	}
++#endif
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
+@@ -436,13 +455,20 @@ SweetBattery::start(IOService *provider)
+ 		return false;
+ 	}
+ #if defined(SWEET_AGM)
+-	int real = 0;   /* AGM H6: static fallback only (gauge/charger are Qualcomm-only here) */
++	/* AGM H6: SC2730 fuel gauge over the ADI bus (bsd/dev/agm_keys.c) */
++	int agm_mv = 0, agm_ma = 0;
++	int real = agm_battery_read(&agm_mv, &agm_ma) == 0 ? 1 : 0;
++	IOLog("SWEET BATTERY: AGM fuel gauge %s (%d mV, %d mA)\n", real ? "ok" : "unavailable", agm_mv, agm_ma);
+ #else
+ 	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ #endif
++#if defined(SWEET_AGM)
++	fReal = real == 1;
++#else
+ 	fReal = real == 1 && sweet_i2c1_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

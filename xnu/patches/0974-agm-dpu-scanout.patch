@@ -1,0 +1,229 @@
+agm-0974: AGM H6 direct scanout through the Unisoc DPU. The GPU pool moves
+below 4 GB (the DPU's layer address is 32 bits): 0xb8000000-0xdc000000, RAM between the
+oemcrypto and widevine carve-outs of the stock DT that nothing here uses; the kernel gets its
+5.75 GB back (mkadt.py). SweetFramebuffer drives the DPU (r6p0, 0x31000000, registers after the
+vendor dpu_r5p0.c: qogirl6 has r5p0) where u-boot left it scanning the boot framebuffer in video mode with its MMU
+off: a window-server frame from the pool is shown by pointing the layer at it (DPU_CTRL REG_UPDATE bit 2,
+taken at vsync, UPDATE_DONE in INT_RAW 0x1ec bit 4): no copy, no tearing. Panics point it
+back at the boot framebuffer. Boot-arg agm_dpu=0: frames copied as before.
+
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 144797bee..c3138f6dc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,10 @@ public:
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+ 	volatile uint32_t *fVig0;
+ 	volatile uint32_t *fCtl0;
++	volatile uint32_t *fDpu;        /* AGM H6: the Unisoc DPU (r6p0) when it can scan our surfaces itself */
++	uint32_t      fDpuLay;          /* ... byte offset of the layer that shows the boot framebuffer */
++	bool          hasScanout(void) const { return fVig0 != NULL || fDpu != NULL; }
++	bool          scanBusy(void);
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
+ 	/* boot-arg sweetfb_lock=1: the vsync timer follows the panel (vsyncNext) */
+@@ -208,6 +212,7 @@ public:
+ 	void          showPending(const uint8_t *rec, SweetSurface **held);
+ 	bool          directEligible(const uint8_t *rec, SweetSurface **held);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
++	void          agmDpuInit(void);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -361,6 +366,7 @@ AppleCLCD::start(IOService *provider)
+ 	 * are drawn straight into the u-boot framebuffer that the DPU scans out.
+ 	 */
+ 	fDsi = NULL;
++	agmDpuInit();
+ #else
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+@@ -561,7 +567,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 			return;
+ 		}
+-		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
++		if (fb->hasScanout() && fb->fScanPhys != fb->fBootSrc) {
+ 			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
+ 		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+@@ -865,8 +871,8 @@ AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	/* (only where the MDP scans surfaces itself: on AGM, fCtl0 == NULL, frames are copied) */
+-	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown && fCtl0 != NULL;
++	/* (only where the display engine scans surfaces itself: the MDP, or the DPU on AGM) */
++	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown && hasScanout();
+ }
+ 
+ void
+@@ -917,9 +923,15 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+-		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
++		for (int t = 0; t < 250 && scanBusy(); t++) {
+ 			IODelay(100);                           /* until the MDP has latched it */
+ 		}
++		if (scanBusy()) {
++			static uint32_t told;
++			if (told++ < 4) {
++				IOLog("SWEET FB: the display engine has not taken a frame in 25 ms\n");
++			}
++		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
+ 		sweet_fps_wait_ns += wns;
+ 		IOLockLock(fLock);
+@@ -957,6 +969,20 @@ AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
++#if defined(SWEET_AGM)
++	if (fDpu != NULL) {
++		/* dpu_r5p0.c: layer address and pitch (pixels), then DPU_CTRL REG_UPDATE: taken at the next vsync */
++		fDpu[(fDpuLay + 0x00) / 4] = (uint32_t)pa;
++		fDpu[(fDpuLay + 0x18) / 4] = stride / 4;
++		__asm__ volatile("dsb sy" ::: "memory");
++		fDpu[0x1e4 / 4] = 1u << 4;              /* INT_CLR: UPDATE_DONE */
++		fDpu[0x04 / 4] |= 1u << 2;
++		__asm__ volatile("dsb sy" ::: "memory");
++		fScanPhys = pa;
++		fScanStride = stride;
++		return;
++	}
++#endif
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -966,6 +992,71 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	fScanStride = stride;
+ }
+ 
++/* Has the display engine not yet taken the address given last? */
++bool
++AppleCLCD::scanBusy(void)
++{
++#if defined(SWEET_AGM)
++	if (fDpu != NULL) {
++		return !(fDpu[0x1ec / 4] & (1u << 4));          /* INT_RAW: UPDATE_DONE */
++	}
++#endif
++	return (fCtl0[0x18 / 4] & 0x20001) != 0;
++}
++
++/*
++ * AGM H6: the Unisoc DPU (r5p0 on qogirl6, 0x31000000; registers after the vendor dpu_r5p0.c:
++ * CTRL 0x04 (RUN, STOP, REG_UPDATE bit 2), CFG0 0x08 (bit 0 EDPI), layers at 0x30 + 0x30 each:
++ * address +0x00, CTRL +0x10 (bit 0 enable), SIZE +0x14, PITCH +0x18 in pixels, POS +0x1c;
++ * INT_CLR 0x1e4, INT_RAW 0x1ec (bit 4 UPDATE_DONE), DPI_CTRL 0x1f0, MMU_EN 0x804) that u-boot
++ * left scanning the boot framebuffer. In video (DPI) mode with its MMU off, a window-server
++ * frame in the GPU pool (below 4 GB: the layer address is 32 bits) is shown by pointing the
++ * layer at it, taken at the next vsync: no copy and no tearing. Boot-arg agm_dpu=0: copied.
++ */
++void
++AppleCLCD::agmDpuInit(void)
++{
++#if defined(SWEET_AGM)
++	volatile uint32_t *d = (volatile uint32_t *)ml_io_map(0x31000000, 0x1000);
++	uint32_t on = 1, layer = 8;
++
++	(void)PE_parse_boot_argn("agm_dpu", &on, sizeof(on));
++	if (d == NULL) {
++		return;
++	}
++	uint32_t ctrl = d[0x04 / 4], cfg0 = d[0x08 / 4], mmu = d[0x804 / 4];
++	IOLog("SWEET FB: DPU ctrl %#x cfg0 %#x panel %#x blend %#x mmu %#x dpi %#x int raw %#x\n", ctrl, cfg0,
++	    d[0x20 / 4], d[0x24 / 4], mmu, d[0x1f0 / 4], d[0x1ec / 4]);
++	for (uint32_t i = 0; i < 8; i++) {
++		volatile uint32_t *l = d + (0x30 + i * 0x30) / 4;
++		if (l[0x10 / 4] & 1) {
++			IOLog("SWEET FB: DPU layer %u: addr %#x ctrl %#x size %#x pitch %u pos %#x alpha %#x crop %#x\n",
++			    i, l[0], l[0x10 / 4], l[0x14 / 4], l[0x18 / 4], l[0x1c / 4], l[0x20 / 4], l[0x2c / 4]);
++			if (layer == 8 && l[0] == (uint32_t)fPhys) {
++				layer = i;
++			}
++		}
++	}
++	/* (CTRL reads 0 while it scans in video mode: the RUN bit does not stay set; INT_RAW shows its vsyncs) */
++	if (!on || layer == 8 || (cfg0 & 1) || (mmu & 1) || fPhys >= (1ull << 32)) {
++		IOLog("SWEET FB: DPU direct scanout off (agm_dpu %u, boot layer %u, EDPI %u, mmu %#x)\n", on, layer,
++		    cfg0 & 1, mmu);
++		return;
++	}
++	fDpu = d;
++	fDpuLay = 0x30 + layer * 0x30;
++	fBootSrc = (uint32_t)fPhys;
++	fBootStride = d[(fDpuLay + 0x18) / 4] * 4;
++	fScanPhys = fBootSrc;
++	fScanStride = fBootStride;
++	fConsPhys = fBootSrc;                   /* (panics draw into the boot framebuffer: shown again) */
++	sweet_cons_fb = this;
++	sweet_console_show_hook = sweet_cons_show;
++	IOLog("SWEET FB: DPU layer %u scans %#x, stride %u: direct scanout of GPU pool frames\n", layer, fBootSrc,
++	    fBootStride);
++#endif
++}
++
+ /*
+  * DCS long write through the DSI command DMA path (topaz-woa: the TPG FIFO
+  * path is a no-op on this DSI 2.4.1). The packet lives in a contiguous
+@@ -1191,7 +1282,7 @@ static void
+ sweet_cons_show(void)
+ {
+ 	AppleCLCD *fb = sweet_cons_fb;
+-	if (fb != NULL && fb->fVig0 != NULL && fb->fScanPhys != fb->fConsPhys) {
++	if (fb != NULL && fb->hasScanout() && fb->fScanPhys != fb->fConsPhys) {
+ 		fb->scanFrom(fb->fConsPhys, fb->fRowBytes);
+ 	}
+ }
+@@ -1254,7 +1345,7 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ bool
+ AppleCLCD::directPresent(const uint8_t *rec)
+ {
+-	if (fVig0 == NULL) {
++	if (!hasScanout()) {
+ 		return false;
+ 	}
+ 	uint32_t mask = get32(rec, 0x104), layer = 32, n = 0;
+@@ -1296,6 +1387,9 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				} else if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);
++				} else if (fDpu != NULL) {
++					s->release();
++					return false;           /* (AGM: not a pool surface: copied into the boot framebuffer) */
+ 				} else {
+ 					sweet_dcache_clean((vm_offset_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
+ 					scanFrom(pa, s->bytesPerRow);
+@@ -1354,7 +1448,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 * framebuffer showed every multi-layer frame (dims, apps) drawn top-down.
+ 	 */
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+-	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
++	if (fFlip[0] == NULL && hasScanout() && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+ 	}
+ 
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index ba50841fa..f47fb8f78 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -160,9 +160,13 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+ #if defined(SWEET_AGM)
+-/* AGM H6: the top 1.25 GB of DRAM, outside the kernel's RAM (mkadt.py AGM_MEM_SIZE); the Mali reaches it */
+-#define GPU_POOL_BASE       0x230000000ull
+-#define GPU_POOL_SIZE       0x50000000ull
++/*
++ * AGM H6: RAM below 4 GB between the stock DT's oemcrypto (to 0xb7200000) and widevine (from
++ * 0xdf400000) carve-outs, which the kernel (RAM from 4 GB) does not manage: the Mali and the
++ * DPU (32-bit layer addresses) both reach it. Nine 64 MB chunks.
++ */
++#define GPU_POOL_BASE       0xb8000000ull
++#define GPU_POOL_SIZE       0x24000000ull
+ #else
+ #define GPU_POOL_BASE       0x90000000ull
+ #define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */

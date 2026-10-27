@@ -1,0 +1,489 @@
+agm-0985: AGM H6 Wi-Fi join. bsd/dev/agm_wifi.c gains WPA2 (PMK from the passphrase by PBKDF2, handed to the
+firmware in WIFI_CMD_CONNECT for its own 4-way), connect/disconnect/STA-LUT events, sta_leave, and logs the
+data channels (8/9) so the real RX format can be read before the data path. agm_wcn_sipc.c gains the data
+channel send/forward (agm_sipc_data_send, agm_wifi_data_msg) and no-answer commands.
+
+diff --git a/bsd/dev/agm_wcn_sipc.c b/bsd/dev/agm_wcn_sipc.c
+index 1e10843c7..ec894de8c 100644
+--- a/bsd/dev/agm_wcn_sipc.c
++++ b/bsd/dev/agm_wcn_sipc.c
+@@ -469,24 +469,54 @@ drain_all(void)
+ 	}
+ }
+ 
+-/* the data channels: for now received blocks are counted and handed back */
+-static unsigned data_rx[2];
++/* the data channels: every message to agm_wifi.c (copied out first), the block handed back */
++extern void agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len);   /* agm_wifi.c */
++static uint8_t data_buf[2048];
+ 
+ static void
+ data_rx_drain(void)
+ {
+ 	uint32_t a, len;
+ 
+-	for (int k = 0; k < 2; k++) {
+-		int n = CH_WIFI_DATA0 + k;
++	for (int n = CH_WIFI_DATA0; n <= CH_WIFI_DATA1; n++) {
+ 		while (ch[n].ready && sblock_receive(&ch[n], &a, &len)) {
+-			if (data_rx[k]++ < 8) {
+-				printf("AGM WIFI data%d rx %u bytes\n", k, len);
+-				hexdump("data", cpv(a), MIN(len, 64u));
++			uint32_t m = MIN(len, (uint32_t)sizeof(data_buf));
++			for (uint32_t i = 0; i < m; i++) {
++				data_buf[i] = *(volatile uint8_t *)(cpv(a) + i);
+ 			}
+ 			sblock_release(n, a);
++			agm_wifi_data_msg(n, data_buf, m);
++		}
++	}
++}
++
++/* one message on the data channel 8 (the firmware's rx buffers, ...); false if no block was free */
++static LCK_GRP_DECLARE(data_lck_grp, "agm-sipc-data");
++static LCK_MTX_DECLARE(data_lock, &data_lck_grp);
++bool agm_sipc_data_send(const void *msg, uint32_t len);
++bool
++agm_sipc_data_send(const void *msg, uint32_t len)
++{
++	struct chan *c = &ch[CH_WIFI_DATA0];
++	uint32_t a = 0;
++
++	if (!c->ready || len > c->txsz) {
++		return false;
++	}
++	lck_mtx_lock(&data_lock);
++	for (unsigned t = 0; t < 200 && (a = sblock_get(c)) == 0; t++) {
++		IOSleep(1);
++	}
++	if (a != 0) {
++		vm_offset_t p = cpv(a);
++		for (uint32_t i = 0; i < len; i++) {
++			*(volatile uint8_t *)(p + i) = ((const uint8_t *)msg)[i];
+ 		}
++		__builtin_arm_dsb(0xf);
++		sblock_send(CH_WIFI_DATA0, a, len);
+ 	}
++	lck_mtx_unlock(&data_lock);
++	return a != 0;
+ }
+ 
+ /* ---- the Wi-Fi command channel (sc2355 msg.h header: {u8 type:3 rsv:1 rsp:1 ctx:3, u8 id, le16 plen,
+@@ -542,6 +572,7 @@ wifi_rx(void)
+  * Any thread; commands go one at a time. Before the service loop runs, the caller polls.
+  */
+ int agm_sipc_cmd(uint8_t id, uint8_t ctx, const void *data, uint32_t dlen, unsigned timeout_ms, void *rsp, uint32_t *rsplen);
++/* timeout_ms 0: no answer asked for (the header's rsp bit clear), none waited for; returns 0 once sent */
+ int
+ agm_sipc_cmd(uint8_t id, uint8_t ctx, const void *data, uint32_t dlen, unsigned timeout_ms, void *rsp, uint32_t *rsplen)
+ {
+@@ -569,7 +600,7 @@ agm_sipc_cmd(uint8_t id, uint8_t ctx, const void *data, uint32_t dlen, unsigned
+ 	for (uint32_t o = 0; o < ((plen + 3) & ~3u); o += 4) {
+ 		wr(p, o, 0);
+ 	}
+-	*(volatile uint8_t *)p = (uint8_t)(0 /* cmd */ | 1u << 4 /* rsp */ | (uint32_t)(ctx & 7) << 5);
++	*(volatile uint8_t *)p = (uint8_t)(0 /* cmd */ | (timeout_ms ? 1u << 4 : 0) /* rsp */ | (uint32_t)(ctx & 7) << 5);
+ 	*(volatile uint8_t *)(p + 1) = id;
+ 	*(volatile uint16_t *)(p + 2) = (uint16_t)plen;
+ 	*(volatile uint32_t *)(p + 4) = (uint32_t)(mach_absolute_time() / 26000);    /* ms */
+@@ -579,6 +610,10 @@ agm_sipc_cmd(uint8_t id, uint8_t ctx, const void *data, uint32_t dlen, unsigned
+ 	__builtin_arm_dsb(0xf);
+ 	rsp_got = 0;
+ 	sblock_send(CH_WIFI_CMD, a, plen);
++	if (timeout_ms == 0) {
++		lck_mtx_unlock(&cmd_lock);
++		return 0;
++	}
+ 	for (unsigned t = 0; t < timeout_ms; t++) {
+ 		if (!service_running) {
+ 			drain_all();
+diff --git a/bsd/dev/agm_wifi.c b/bsd/dev/agm_wifi.c
+index 216ef90cf..ac6075b9b 100644
+--- a/bsd/dev/agm_wifi.c
++++ b/bsd/dev/agm_wifi.c
+@@ -40,6 +40,19 @@ void agm_wifi_bring_up(void);
+ #define WIFI_EVENT_DISCONNECT   0x81
+ #define WIFI_EVENT_SCAN_DONE    0x82
+ #define WIFI_EVENT_MGMT_FRAME   0x83
++#define WIFI_EVENT_STA_LUT_INDEX 0xf5
++#define WIFI_CMD_CONNECT        10
++#define WIFI_CMD_DISCONNECT     13
++#define WIFI_CMD_KEY            14
++#define WIFI_CMD_SET_IE         25
++#define IE_ASSOC_REQ            3
++
++/* sc2355 cipher/akm (cmdevt.h); OR SPRDWL_VALID_CONFIG into a field that is being set */
++#define CIPHER_TKIP             3
++#define CIPHER_CCMP             4
++#define AKM_PSK                 2
++#define VALID_CONFIG            0x80
++#define WPA_VERSION_2           (1u << 1)
+ 
+ #include "agm_wifi_ini.h"
+ 
+@@ -47,6 +60,14 @@ static uint8_t wifi_mac[6];
+ static uint8_t sta_ctx;
+ static volatile uint8_t scan_done;
+ 
++/* the join */
++enum { ST_IDLE, ST_CONNECTING, ST_CONNECTED };
++static volatile int sta_cstate;
++static volatile int8_t connect_result;          /* 0 pending-ok, 1 associated, -1 failed */
++static struct redwood_sta_bss joined_bss;
++static int join_last_error;
++static uint8_t sta_lut = 0xff;                   /* the firmware's LUT index for this peer (data path) */
++
+ /* ---- what the scans hear ---- */
+ #define BSS_MOST        48
+ struct bss {
+@@ -136,6 +157,52 @@ event_mgmt_frame(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++static void
++event_connect(const uint8_t *d, uint32_t len)
++{
++	/* {u8 status; u8 bssid[6]; u8 channel; s8 signal; le16 req_ie_len; req_ie; ...} (cmdevt.c) */
++	uint8_t status = len ? d[0] : 0xff;
++
++	if (status != 0) {
++		printf("AGM WIFI: connect failed, status %u\n", status);
++		join_last_error = EAUTH;
++		connect_result = -1;
++		return;
++	}
++	if (len >= 7) {
++		memcpy(joined_bss.bssid, d + 1, 6);
++	}
++	printf("AGM WIFI: *** associated to %02x:%02x:%02x:%02x:%02x:%02x channel %u ***\n",
++	    joined_bss.bssid[0], joined_bss.bssid[1], joined_bss.bssid[2], joined_bss.bssid[3], joined_bss.bssid[4],
++	    joined_bss.bssid[5], len >= 8 ? d[7] : 0);
++	join_last_error = 0;
++	connect_result = 1;
++}
++
++static void
++event_disconnect(const uint8_t *d, uint32_t len)
++{
++	uint16_t reason = len >= 2 ? (uint16_t)(d[0] | d[1] << 8) : 0;
++
++	printf("AGM WIFI: disconnect, reason %u (state %d)\n", reason, sta_cstate);
++	if (sta_cstate == ST_CONNECTED) {
++		redwood_net_link_state(false);
++		redwood_sta_lost(ECONNRESET);
++	}
++	sta_cstate = ST_IDLE;
++	sta_lut = 0xff;
++}
++
++static void
++event_sta_lut(const uint8_t *d, uint32_t len)
++{
++	/* {u8 ctx_id; u8 action; u8 sta_lut_index; u8 ra[6]; ...} */
++	if (len >= 3) {
++		sta_lut = d[2];
++		printf("AGM WIFI: STA LUT index %u (action %u)\n", d[2], d[1]);
++	}
++}
++
+ /* from the SIPC thread: everything the firmware says by itself */
+ void
+ agm_wifi_event(uint8_t id, uint8_t ctx, const uint8_t *data, uint32_t len)
+@@ -148,6 +215,15 @@ agm_wifi_event(uint8_t id, uint8_t ctx, const uint8_t *data, uint32_t len)
+ 		printf("AGM WIFI: scan done (type %u)\n", len ? data[0] : 0);
+ 		scan_done = 1;
+ 		break;
++	case WIFI_EVENT_CONNECT:
++		event_connect(data, len);
++		break;
++	case WIFI_EVENT_DISCONNECT:
++		event_disconnect(data, len);
++		break;
++	case WIFI_EVENT_STA_LUT_INDEX:
++		event_sta_lut(data, len);
++		break;
+ 	default:
+ 		printf("AGM WIFI: event %#x ctx %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", id, ctx, len,
+ 		    len > 0 ? data[0] : 0, len > 1 ? data[1] : 0, len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
+@@ -156,6 +232,96 @@ agm_wifi_event(uint8_t id, uint8_t ctx, const uint8_t *data, uint32_t len)
+ 	}
+ }
+ 
++/* ---- WPA2 PMK from the passphrase (PBKDF2-HMAC-SHA1, 4096), self-contained ---- */
++struct w_sha1 { uint32_t h[5]; uint64_t n; uint8_t b[64]; uint32_t bl; };
++static inline uint32_t w_rol32(uint32_t v, int sh) { return (v << sh) | (v >> (32 - sh)); }
++
++static void
++w_sha1_block(struct w_sha1 *c, const uint8_t *p)
++{
++	uint32_t w[80], a = c->h[0], b = c->h[1], d = c->h[2], e = c->h[3], f = c->h[4];
++	for (int i = 0; i < 16; i++) {
++		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
++	}
++	for (int i = 16; i < 80; i++) {
++		w[i] = w_rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++	for (int i = 0; i < 80; i++) {
++		uint32_t k, x;
++		if (i < 20) { x = (b & d) | (~b & e); k = 0x5A827999; }
++		else if (i < 40) { x = b ^ d ^ e; k = 0x6ED9EBA1; }
++		else if (i < 60) { x = (b & d) | (b & e) | (d & e); k = 0x8F1BBCDC; }
++		else { x = b ^ d ^ e; k = 0xCA62C1D6; }
++		uint32_t t = w_rol32(a, 5) + x + f + k + w[i];
++		f = e; e = d; d = w_rol32(b, 30); b = a; a = t;
++	}
++	c->h[0] += a; c->h[1] += b; c->h[2] += d; c->h[3] += e; c->h[4] += f;
++}
++
++static void
++w_sha1_init(struct w_sha1 *c)
++{
++	c->h[0] = 0x67452301; c->h[1] = 0xEFCDAB89; c->h[2] = 0x98BADCFE; c->h[3] = 0x10325476; c->h[4] = 0xC3D2E1F0;
++	c->n = 0; c->bl = 0;
++}
++
++static void
++w_sha1_update(struct w_sha1 *c, const uint8_t *p, size_t len)
++{
++	c->n += len;
++	while (len > 0) {
++		uint32_t take = (uint32_t)MIN((size_t)(64 - c->bl), len);
++		memcpy(c->b + c->bl, p, take);
++		c->bl += take; p += take; len -= take;
++		if (c->bl == 64) { w_sha1_block(c, c->b); c->bl = 0; }
++	}
++}
++
++static void
++w_sha1_final(struct w_sha1 *c, uint8_t out[20])
++{
++	uint64_t bits = c->n * 8;
++	uint8_t pad = 0x80, z = 0, l[8];
++	w_sha1_update(c, &pad, 1);
++	while (c->bl != 56) { w_sha1_update(c, &z, 1); }
++	for (int i = 0; i < 8; i++) { l[i] = (uint8_t)(bits >> (56 - 8 * i)); }
++	w_sha1_update(c, l, 8);
++	for (int i = 0; i < 5; i++) {
++		out[4 * i] = (uint8_t)(c->h[i] >> 24); out[4 * i + 1] = (uint8_t)(c->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(c->h[i] >> 8); out[4 * i + 3] = (uint8_t)c->h[i];
++	}
++}
++
++static void
++w_hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *a, size_t al, const uint8_t *b, size_t bl, uint8_t out[20])
++{
++	uint8_t k[64] = { 0 }, ipad[64], opad[64], inner[20];
++	struct w_sha1 s;
++	if (klen > 64) { w_sha1_init(&s); w_sha1_update(&s, key, klen); w_sha1_final(&s, k); }
++	else { memcpy(k, key, klen); }
++	for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
++	w_sha1_init(&s); w_sha1_update(&s, ipad, 64);
++	if (al) { w_sha1_update(&s, a, al); }
++	if (bl) { w_sha1_update(&s, b, bl); }
++	w_sha1_final(&s, inner);
++	w_sha1_init(&s); w_sha1_update(&s, opad, 64); w_sha1_update(&s, inner, 20); w_sha1_final(&s, out);
++}
++
++static void
++w_pbkdf2_pmk(const uint8_t *pass, size_t plen, const uint8_t *ssid, size_t slen, uint8_t pmk[32])
++{
++	for (uint32_t blk = 1; blk <= 2; blk++) {
++		uint8_t cnt[4] = { 0, 0, 0, (uint8_t)blk }, u[20], t[20];
++		w_hmac_sha1(pass, plen, ssid, slen, cnt, 4, u);
++		memcpy(t, u, 20);
++		for (int i = 1; i < 4096; i++) {
++			w_hmac_sha1(pass, plen, u, 20, NULL, 0, u);
++			for (int j = 0; j < 20; j++) { t[j] ^= u[j]; }
++		}
++		memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
++	}
++}
++
+ /* ---- the station side of sys/redwood_sta.h ---- */
+ static const uint8_t g5_channels[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+ 	                               132, 136, 140, 149, 153, 157, 161, 165 };
+@@ -224,16 +390,142 @@ sta_heard(void (*each)(const struct redwood_sta_bss *bss, void *context), void *
+ 	}
+ }
+ 
++/* the group cipher from the joined network's RSN element (48): CCMP(4) by default, TKIP(3) if so */
++static uint8_t
++group_cipher_of(const struct redwood_sta_bss *b)
++{
++	for (uint32_t o = 0; o + 2 <= b->elements_length;) {
++		uint8_t id = b->elements[o], l = b->elements[o + 1];
++		if (o + 2 + l > b->elements_length) {
++			break;
++		}
++		if (id == 48 && l >= 6 && b->elements[o + 2] == 1 && b->elements[o + 3] == 0 &&
++		    b->elements[o + 4] == 0x00 && b->elements[o + 5] == 0x0f && b->elements[o + 6] == 0xac) {
++			return b->elements[o + 7] == 2 ? CIPHER_TKIP : CIPHER_CCMP;
++		}
++		o += 2u + l;
++	}
++	return CIPHER_CCMP;
++}
++
+ static int
+ sta_join(const struct redwood_sta_join *what)
+ {
+-	printf("AGM WIFI: join \"%.*s\" asked: not there yet\n", what->ssid_length, (const char *)what->ssid);
+-	return ENOTSUP;
++	struct redwood_sta_bss best;
++	bool found = false, want_bssid = false;
++	uint8_t pmk[32], con[82];
++	int16_t rssi = -32768;
++
++	for (int i = 0; i < 6; i++) {
++		want_bssid |= what->bssid[i] != 0;
++	}
++	/* the AP: the one asked for by BSSID, else the strongest with that name */
++	lck_mtx_lock(&bss_lock);
++	for (int i = 0; i < BSS_MOST; i++) {
++		if (!bss_table[i].used) {
++			continue;
++		}
++		struct redwood_sta_bss *b = &bss_table[i].b;
++		bool match = want_bssid ? memcmp(b->bssid, what->bssid, 6) == 0 :
++		    (b->ssid_length == what->ssid_length && memcmp(b->ssid, what->ssid, what->ssid_length) == 0);
++		if (match && b->rssi > rssi) {
++			best = *b;
++			rssi = b->rssi;
++			found = true;
++		}
++	}
++	lck_mtx_unlock(&bss_lock);
++	if (!found) {
++		printf("AGM WIFI: join: \"%.*s\" not heard\n", what->ssid_length, (const char *)what->ssid);
++		return ENOENT;
++	}
++
++	bool secured = what->security == REDWOOD_STA_WPA2_PSK;
++	if (secured) {
++		if (what->passphrase_length > 0) {
++			w_pbkdf2_pmk(what->passphrase, what->passphrase_length, what->ssid, what->ssid_length, pmk);
++		} else {
++			memcpy(pmk, what->pmk, 32);
++		}
++	}
++	uint8_t grp = secured ? group_cipher_of(&best) : 0;
++	unsigned chan = best.frequency == 2484 ? 14 : best.frequency < 2484 ? (best.frequency - 2407) / 5 :
++	    (best.frequency - 5000) / 5;
++
++	bzero(con, sizeof(con));
++	uint32_t wpa = secured ? WPA_VERSION_2 : 0;
++	memcpy(con + 0, &wpa, 4);
++	memcpy(con + 4, best.bssid, 6);
++	con[10] = (uint8_t)chan;
++	con[11] = 0;                            /* auth: open */
++	con[12] = secured ? (CIPHER_CCMP | VALID_CONFIG) : 0;
++	con[13] = secured ? (grp | VALID_CONFIG) : 0;
++	con[14] = secured ? (AKM_PSK | VALID_CONFIG) : 0;
++	con[15] = 0;                            /* mfp off */
++	con[16] = secured ? 32 : 0;             /* psk_len: the PMK, for the firmware to run the 4-way itself */
++	con[17] = what->ssid_length;
++	if (secured) {
++		memcpy(con + 18, pmk, 32);
++	}
++	memcpy(con + 50, what->ssid, what->ssid_length);
++
++	printf("AGM WIFI: join \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x chan %u %s\n", what->ssid_length,
++	    (const char *)what->ssid, best.bssid[0], best.bssid[1], best.bssid[2], best.bssid[3], best.bssid[4],
++	    best.bssid[5], chan, secured ? "WPA2-PSK" : "open");
++
++	/* the association request carries our RSN element (WPA2-PSK, CCMP; the AP's group cipher), as the
++	 * supplicant sets it on Android (SET_IE, assoc request): without it a WPA2 AP refuses (status 1) */
++	{
++		uint8_t ie[3 + 22];
++		uint16_t l = secured ? 22 : 0;
++		ie[0] = IE_ASSOC_REQ;
++		memcpy(ie + 1, &l, 2);
++		if (secured) {
++			static const uint8_t rsn[22] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4,
++				                         1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
++			memcpy(ie + 3, rsn, 22);
++			ie[3 + 7] = grp;
++		}
++		if (agm_sipc_cmd(WIFI_CMD_SET_IE, sta_ctx, ie, 3u + l, 2000, NULL, NULL) < 0) {
++			printf("AGM WIFI: join: SET_IE refused\n");
++		}
++	}
++
++	bzero(&joined_bss, sizeof(joined_bss));
++	joined_bss = best;
++	connect_result = 0;
++	sta_cstate = ST_CONNECTING;
++	int r = agm_sipc_cmd(WIFI_CMD_CONNECT, sta_ctx, con, sizeof(con), 3000, NULL, NULL);
++	bzero(pmk, sizeof(pmk));
++	bzero(con, sizeof(con));
++	if (r < 0) {
++		sta_cstate = ST_IDLE;
++		return EIO;
++	}
++	for (unsigned t = 0; t < 10000 && connect_result == 0; t += 10) {
++		IOSleep(10);
++	}
++	if (connect_result != 1) {
++		sta_cstate = ST_IDLE;
++		return join_last_error ? join_last_error : ETIMEDOUT;
++	}
++	sta_cstate = ST_CONNECTED;
++	/* the data path is not up yet, so the link stays down (no DHCP): association only, for now */
++	printf("AGM WIFI: join done; data path still to come\n");
++	return 0;
+ }
+ 
+ static int
+ sta_leave(void)
+ {
++	uint16_t reason = 3;
++
++	if (sta_cstate != ST_IDLE) {
++		(void)agm_sipc_cmd(WIFI_CMD_DISCONNECT, sta_ctx, &reason, 2, 2000, NULL, NULL);
++		sta_cstate = ST_IDLE;
++		sta_lut = 0xff;
++		redwood_net_link_state(false);
++	}
+ 	return 0;
+ }
+ 
+@@ -241,7 +533,12 @@ static void
+ sta_state(struct redwood_sta_state *state)
+ {
+ 	bzero(state, sizeof(*state));
+-	state->phase = REDWOOD_STA_IDLE;
++	state->phase = sta_cstate == ST_CONNECTED ? REDWOOD_STA_JOINED :
++	    sta_cstate == ST_CONNECTING ? REDWOOD_STA_JOINING : REDWOOD_STA_IDLE;
++	if (sta_cstate == ST_CONNECTED) {
++		state->bss = joined_bss;
++	}
++	state->last_error = join_last_error;
+ }
+ 
+ static unsigned
+@@ -326,6 +623,25 @@ mac_from_boot_arg(void)
+ 	}
+ }
+ 
++/* from the SIPC thread: a block the firmware put on a data channel (8 or 9). For now, logged so the
++ * real RX descriptor/address-buffer format can be read before the data path is written. */
++void agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len);
++void
++agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len)
++{
++	static unsigned seen[2];
++	int k = channel == 9 ? 1 : 0;
++
++	if (seen[k]++ < 12) {
++		char line[3 * 48 + 1];
++		unsigned n = 0;
++		for (uint32_t i = 0; i < len && i < 48; i++) {
++			n += (unsigned)snprintf(line + n, sizeof(line) - n, "%02x ", msg[i]);
++		}
++		printf("AGM WIFI data ch%d: %u bytes: %s\n", channel, len, line);
++	}
++}
++
+ void
+ agm_wifi_bring_up(void)
+ {

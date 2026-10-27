@@ -1,0 +1,85 @@
+agm-0963: the AGM sampler walks user stacks again, after task_unlock(), as
+"SMP name tN ubt ..." lines (0961 had dropped the walk to avoid hanging under
+the task lock).
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 08acf908c..5c4e7b672 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -996,6 +996,11 @@ sweet_crash_strings(const char *name)
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ 
++#if defined(SWEET_AGM)
++#define SWEET_UBT_MAX 48
++static uint64_t sweet_ubt_fp[SWEET_UBT_MAX];  /* the sampler is a single thread */
++#endif
++
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+ {
+@@ -1011,6 +1016,11 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	}
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+ 
++#if defined(SWEET_AGM)
++	for (int i = 0; i < SWEET_UBT_MAX; i++) {
++		sweet_ubt_fp[i] = 0;
++	}
++#endif
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+@@ -1020,12 +1030,15 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 
+ #if defined(SWEET_AGM)
+ 		(void)fp;
+-		(void)map;
+-		n = snprintf(line, sizeof(line), "SMP %s t%d", name, tn++);
++		n = snprintf(line, sizeof(line), "SMP %s t%d", name, tn);
+ 		if (ss != NULL && is_saved_state64(ss)) {
+ 			n += snprintf(line + n, sizeof(line) - n, " pc 0x%llx lr 0x%llx sp 0x%llx",
+ 			    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++			if (tn < SWEET_UBT_MAX) {
++				sweet_ubt_fp[tn] = get_saved_state_fp(ss);
++			}
+ 		}
++		tn++;
+ 		n += snprintf(line + n, sizeof(line) - n, " state 0x%x wait 0x%llx hint %d",
+ 		    thread->state, (uint64_t)thread->wait_event, (int)thread->block_hint);
+ 		if (thread != current_thread() && thread->kernel_stack != 0 && thread->machine.kstackptr != 0) {
+@@ -1046,6 +1059,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		}
+ 		printf("%s\n", line);
+ #else
++		(void)map;
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+@@ -1067,6 +1081,26 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ #endif
+ 	}
+ 	task_unlock(task);
++#if defined(SWEET_AGM)
++	/* User frame walk without the task lock: a stalled page-in only stalls us. */
++	for (int t = 0; t < tn && t < SWEET_UBT_MAX; t++) {
++		uint64_t ufp = sweet_ubt_fp[t];
++		char line[400];
++		int n = snprintf(line, sizeof(line), "SMP %s t%d ubt", name, t);
++		for (int i = 0; i < 24 && ufp != 0 && (ufp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++			uint64_t frame[2];
++			if (vm_map_read_user(map, ufp, frame, sizeof(frame)) != KERN_SUCCESS) {
++				break;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			if (frame[0] <= ufp) {
++				break;
++			}
++			ufp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++#endif
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

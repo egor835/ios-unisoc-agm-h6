@@ -1,0 +1,484 @@
+From 7e88301c3768cd124d96bb7367d6dfaeacda36b7 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 27 Oct 2026 22:28:22 +0300
+Subject: [PATCH] agm 0987 wifi data path: shared-memory TX/RX buffers by
+ address messages, en0 link up after the join
+
+---
+ bsd/dev/agm_wcn_sipc.c |   2 +
+ bsd/dev/agm_wifi.c     | 377 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 350 insertions(+), 29 deletions(-)
+
+diff --git a/bsd/dev/agm_wcn_sipc.c b/bsd/dev/agm_wcn_sipc.c
+index ec894de8c..30d526369 100644
+--- a/bsd/dev/agm_wcn_sipc.c
++++ b/bsd/dev/agm_wcn_sipc.c
+@@ -525,6 +525,7 @@ agm_sipc_data_send(const void *msg, uint32_t len)
+ 
+ extern void agm_wifi_event(uint8_t id, uint8_t ctx, const uint8_t *data, uint32_t len);   /* agm_wifi.c */
+ extern void agm_wifi_bring_up(void);
++extern void agm_wifi_service(void);
+ 
+ static LCK_GRP_DECLARE(sipc_lck_grp, "agm-sipc");
+ static LCK_MTX_DECLARE(cmd_lock, &sipc_lck_grp);
+@@ -686,6 +687,7 @@ agm_wcn_sipc_run(void)
+ 		drain_all();
+ 		wifi_rx();
+ 		data_rx_drain();
++		agm_wifi_service();             /* agm_wifi.c: RX buffers back to the firmware */
+ 		IOSleep(2);
+ 	}
+ }
+diff --git a/bsd/dev/agm_wifi.c b/bsd/dev/agm_wifi.c
+index bd236ef5d..f068c0eb4 100644
+--- a/bsd/dev/agm_wifi.c
++++ b/bsd/dev/agm_wifi.c
+@@ -17,7 +17,7 @@
+  * EAPOL frames come up on data channel 9 as "special data" (an rx_msdu_desc, type 3, the frame as Ethernet at
+  * its msdu_offset), ours go down as WIFI_CMD_TX_DATA {5 bytes address, tx_msdu_dscr, the Ethernet frame}, the
+  * keys by WIFI_CMD_KEY ADD (pairwise index 0 with the AP's address, then the group key).
+- * The data path is not there yet.
++ * Data: see "the data path" below; en0's link goes up once the join (and its keys) is done.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_AGM)
+ #include <sys/param.h>
+@@ -48,6 +48,7 @@ void agm_wifi_bring_up(void);
+ #define WIFI_EVENT_SCAN_DONE    0x82
+ #define WIFI_EVENT_MGMT_FRAME   0x83
+ #define WIFI_EVENT_STA_LUT_INDEX 0xf5
++#define WIFI_EVENT_WFD_MIB_CNT  0xf9
+ #define WIFI_CMD_CONNECT        10
+ #define WIFI_CMD_DISCONNECT     13
+ #define WIFI_CMD_KEY            14
+@@ -247,6 +248,8 @@ agm_wifi_event(uint8_t id, uint8_t ctx, const uint8_t *data, uint32_t len)
+ 	case WIFI_EVENT_STA_LUT_INDEX:
+ 		event_sta_lut(data, len);
+ 		break;
++	case WIFI_EVENT_WFD_MIB_CNT:
++		break;                                  /* the firmware's counters, every few seconds */
+ 	default:
+ 		printf("AGM WIFI: event %#x ctx %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", id, ctx, len,
+ 		    len > 0 ? data[0] : 0, len > 1 ? data[1] : 0, len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
+@@ -848,6 +851,10 @@ hs_forget(void)
+ 	lck_mtx_unlock(&hs_lock);
+ }
+ 
++/* the data path's, further down */
++static vm_offset_t dp_tx;
++static void dp_print_stats(const char *why);
++
+ /* ---- the station side of sys/redwood_sta.h ---- */
+ static const uint8_t g5_channels[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+ 	                               132, 136, 140, 149, 153, 157, 161, 165 };
+@@ -1062,8 +1069,11 @@ sta_join(const struct redwood_sta_join *what)
+ 		}
+ 	}
+ 	sta_cstate = ST_CONNECTED;
+-	/* the data path is not up yet, so the link stays down (no DHCP): association and keys only, for now */
+-	printf("AGM WIFI: join done%s; data path still to come\n", secured ? " (WPA2 keys in)" : "");
++	printf("AGM WIFI: join done%s; the link is up\n", secured ? " (WPA2 keys in)" : "");
++	if (dp_tx != 0) {
++		dp_print_stats("joined");
++		redwood_net_link_state(true);
++	}
+ 	return 0;
+ }
+ 
+@@ -1121,10 +1131,317 @@ static struct redwood_sta_ops sta_ops = {
+ 	.channels = sta_channels,
+ };
+ 
++/*
++ * ---- the data path (the vendor's SIPC variant: sipc_txrx_mm.c, mm.c, if_sc2355.c) ----
++ * Frames do not ride the sblocks: they sit in shared memory, 0x87380000 + 0x280000 (TX buffers from the start,
++ * RX buffers from +0x1b5800), and the data channels carry their addresses, "address messages" (type 4, 5-byte
++ * addresses as the CP sees them: 0x80000000 | the low 24 bits of the physical address).
++ *   RX buffers to the firmware (channel 8): {u8 common: type 4, reserv 1; u8 type 0; u8 num; num x 5 bytes}.
++ *   The firmware says which it filled (channel 8/9): {common: type 4, reserv 1; le32 time; le16 seq; u8 tlv_num;
++ *     tlvs {u8 type (0 process), u8 num, num x 5 bytes}}; each buffer: rx_mh_desc (28 bytes), rx_msdu_desc
++ *     (host_type:4 ctx:4 msdu_offset:8 msdu_len:16, ...), the frame as Ethernet at msdu_offset from the start.
++ *   TX (channel 8): the buffer {5 bytes: its own address; tx_msdu_dscr (type 2 data); the Ethernet frame}, then
++ *     {common: type 4, buffer_type 1, interface = ctx; offset 7; 0x80 in use; le16 number; le16 0; addresses}.
++ *   TX done (channel 8/9): {common: type 4, reserv 0; offset; ctrl; le16 number; le16 rsvd; addresses + 0x10}.
++ */
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern bool agm_sipc_data_send(const void *msg, uint32_t len);
++
++#define DP_PA                   0x87380000UL
++#define DP_RX_OFF               0x1b5800u
++#define DP_BUF                  1792u           /* ALIGN(1676 + 8, 128), as the vendor's */
++#define DP_TX_N                 64u
++#define DP_RX_N                 256u
++#define DP_RX_LEN               1676u
++#define DP_ADD_ONCE             52u
++#define CP_ADDR(pa)             (0x80000000u | ((uint32_t)(pa) & 0xffffffu))
++
++static vm_offset_t dp_tx, dp_rx;                /* mappings of the TX and RX pools */
++static uint64_t dp_tx_pa, dp_rx_pa;
++static uint8_t dp_tx_busy[DP_TX_N];
++static uint64_t dp_tx_since[DP_TX_N];
++static uint16_t dp_rx_back[DP_RX_N];            /* RX buffers to give back to the firmware */
++static unsigned dp_rx_back_n;
++static uint8_t dp_rx_out[DP_RX_N];              /* the firmware has it */
++static LCK_MTX_DECLARE(dp_tx_lock, &wifi_lck_grp);
++static struct { uint64_t rx, rx_bad, tx, tx_full, tx_fail, tx_reclaimed, txc, txc_bad, rx_posted; } dp_st;
++static uint8_t dp_frame[DP_RX_LEN];
++
++static void
++put5(uint8_t *p, uint32_t a)
++{
++	p[0] = (uint8_t)a; p[1] = (uint8_t)(a >> 8); p[2] = (uint8_t)(a >> 16); p[3] = (uint8_t)(a >> 24); p[4] = 0;
++}
++
++static uint64_t
++get5(const uint8_t *p)
++{
++	return (uint64_t)p[0] | (uint64_t)p[1] << 8 | (uint64_t)p[2] << 16 | (uint64_t)p[3] << 24 | (uint64_t)p[4] << 32;
++}
++
++/* a CP address back to the physical one (mm_single_buffer_unlink) */
++static uint64_t
++dp_pa_of(uint64_t cp)
++{
++	return ((cp & ((1ULL << 40) - 1) & ~(1ULL << 39)) & 0xffffffu) | 0x87000000u;
++}
++
++static bool
++dp_init(void)
++{
++	/* page-aligned mappings, kept small (an 8 MB one did not fit): TX 64 buffers, RX 256 */
++	dp_tx_pa = DP_PA;
++	dp_tx = ml_io_map_wcomb(DP_PA, (DP_TX_N * DP_BUF + 0x3fff) & ~0x3fffu);
++	uint64_t rx_page = (DP_PA + DP_RX_OFF) & ~0x3fffULL;
++	uint32_t rx_in = (uint32_t)(DP_PA + DP_RX_OFF - rx_page);
++	vm_offset_t m = ml_io_map_wcomb((vm_offset_t)rx_page, (rx_in + DP_RX_N * DP_BUF + 0x3fff) & ~0x3fffu);
++	if (!dp_tx || !m) {
++		printf("AGM WIFI: data path: shared memory not mapped\n");
++		return false;
++	}
++	dp_rx = m + rx_in;
++	dp_rx_pa = DP_PA + DP_RX_OFF;
++	bzero((void *)dp_tx, DP_TX_N * DP_BUF);
++	bzero((void *)dp_rx, DP_RX_N * DP_BUF);
++	__builtin_arm_dsb(0xf);
++	return true;
++}
++
++/* give back what is waiting, at most 52 a message (from the SIPC thread, or before it serves) */
++static void
++dp_rx_post(void)
++{
++	uint8_t msg[3 + DP_ADD_ONCE * 5];
++
++	while (dp_rx_back_n > 0) {
++		unsigned n = MIN(dp_rx_back_n, DP_ADD_ONCE);
++		msg[0] = 4 | 1u << 3;                   /* type 4, reserv: "this adds RX buffers" */
++		msg[1] = 0;
++		msg[2] = (uint8_t)n;
++		for (unsigned i = 0; i < n; i++) {
++			unsigned b = dp_rx_back[dp_rx_back_n - 1 - i];
++			put5(msg + 3 + 5 * i, CP_ADDR(dp_rx_pa + (uint64_t)b * DP_BUF));
++		}
++		if (!agm_sipc_data_send(msg, 3 + 5 * n)) {
++			printf("AGM WIFI: data path: RX buffers not given (%u waiting)\n", dp_rx_back_n);
++			return;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			dp_rx_out[dp_rx_back[dp_rx_back_n - 1 - i]] = 1;
++		}
++		dp_rx_back_n -= n;
++		dp_st.rx_posted += n;
++	}
++}
++
++/* one Ethernet frame from the radio: EAPOL to the handshake, the rest to en0 */
++static void
++dp_deliver(const uint8_t *e, uint32_t len)
++{
++	if (len >= 14 && e[12] == 0x88 && e[13] == 0x8e) {
++		eapol_queue(e, len);
++		return;
++	}
++	if (sta_cstate != ST_CONNECTED || len < 14 || len > REDWOOD_NET_FRAME_MAX) {
++		dp_st.rx_bad++;
++		return;
++	}
++	dp_st.rx++;
++	redwood_net_input(e, len);
++}
++
++static void
++dp_rx_buffer(uint64_t cp)
++{
++	uint64_t pa = dp_pa_of(cp), o = pa - dp_rx_pa;
++	static unsigned dumped;
++
++	if (pa < dp_rx_pa || o >= (uint64_t)DP_RX_N * DP_BUF || o % DP_BUF != 0) {
++		if (dp_st.rx_bad++ < 8) {
++			printf("AGM WIFI: RX address %#llx is none of ours\n", (unsigned long long)cp);
++		}
++		return;
++	}
++	unsigned b = (unsigned)(o / DP_BUF);
++	const uint8_t *p = (const uint8_t *)(dp_rx + o);
++	uint32_t off = p[28 + 1], mlen = (uint32_t)p[28 + 2] | (uint32_t)p[28 + 3] << 8;
++	if (dumped < 4) {
++		dumped++;
++		w_hexdump("data rx", p, MIN(off + 32u, 128u));
++	}
++	if (off >= 56 && off + mlen <= DP_RX_LEN && mlen >= 14) {
++		memcpy(dp_frame, p + off, mlen);
++		dp_deliver(dp_frame, mlen);
++	} else if (dp_st.rx_bad++ < 8) {
++		printf("AGM WIFI: RX buffer %u: offset %u length %u?\n", b, off, mlen);
++	}
++	bzero((void *)(dp_rx + o), 64);
++	if (dp_rx_out[b]) {
++		dp_rx_out[b] = 0;
++		dp_rx_back[dp_rx_back_n++] = (uint16_t)b;
++	}
++}
++
++static void
++dp_rx_event(const uint8_t *msg, uint32_t len)
++{
++	uint32_t o = 8;
++	unsigned tlvs = len >= 8 ? msg[7] : 0;
++
++	while (tlvs-- > 0 && o + 2 <= len) {
++		uint8_t type = msg[o], n = msg[o + 1];
++		if (o + 2 + 5u * n > len) {
++			break;
++		}
++		if (type == 0) {                        /* SPRDWL_PROCESS_BUFFER */
++			for (unsigned i = 0; i < n; i++) {
++				dp_rx_buffer(get5(msg + o + 2 + 5 * i));
++			}
++		} else {
++			printf("AGM WIFI: RX event type %u (%u addresses)\n", type, n);
++		}
++		o += 2u + 5u * n;
++	}
++	/* given back by agm_wifi_service(), after the whole batch */
++}
++
++static void
++dp_tx_done(const uint8_t *msg, uint32_t len)
++{
++	unsigned n = len >= 5 ? (unsigned)(msg[3] | msg[4] << 8) : 0;
++	static unsigned logged;
++
++	if (logged < 3) {
++		logged++;
++		w_hexdump("data txc", msg, MIN(len, 64u));
++	}
++	lck_mtx_lock(&dp_tx_lock);
++	for (unsigned i = 0; i < n && 7 + 5 * i + 5 <= len; i++) {
++		uint64_t cp = get5(msg + 7 + 5 * i), pa = dp_pa_of(cp - 0x10), o = pa - dp_tx_pa;   /* -0x10: the vendor's "HW issue" */
++		if (pa < dp_tx_pa || o >= (uint64_t)DP_TX_N * DP_BUF || o % DP_BUF != 0) {
++			pa = dp_pa_of(cp);
++			o = pa - dp_tx_pa;
++		}
++		if (pa >= dp_tx_pa && o < (uint64_t)DP_TX_N * DP_BUF && o % DP_BUF == 0 && dp_tx_busy[o / DP_BUF]) {
++			dp_tx_busy[o / DP_BUF] = 0;
++			dp_st.txc++;
++		} else if (dp_st.txc_bad++ < 8) {
++			printf("AGM WIFI: TX done for %#llx, none of ours\n", (unsigned long long)cp);
++		}
++	}
++	lck_mtx_unlock(&dp_tx_lock);
++}
++
++/* a free TX buffer, or -1; one not given back for 2 s is taken back (a lost "done") */
++static int
++dp_tx_get(void)
++{
++	uint64_t now = ms_now();
++	int b = -1;
++
++	lck_mtx_lock(&dp_tx_lock);
++	for (unsigned i = 0; i < DP_TX_N && b < 0; i++) {
++		if (!dp_tx_busy[i]) {
++			b = (int)i;
++		} else if (now - dp_tx_since[i] > 2000) {
++			b = (int)i;
++			dp_st.tx_reclaimed++;
++		}
++	}
++	if (b >= 0) {
++		dp_tx_busy[b] = 1;
++		dp_tx_since[b] = now;
++	}
++	lck_mtx_unlock(&dp_tx_lock);
++	return b;
++}
++
++static void
++dp_print_stats(const char *why)
++{
++	printf("AGM WIFI data (%s): rx %llu (bad %llu), tx %llu (full %llu, failed %llu, taken back %llu), "
++	    "tx done %llu (bad %llu), RX buffers given %llu\n", why, dp_st.rx, dp_st.rx_bad, dp_st.tx, dp_st.tx_full,
++	    dp_st.tx_fail, dp_st.tx_reclaimed, dp_st.txc, dp_st.txc_bad, dp_st.rx_posted);
++}
++
++/* from the SIPC thread's loop (every 2 ms): RX buffers back to the firmware, now and then the counters */
++void agm_wifi_service(void);
++void
++agm_wifi_service(void)
++{
++	static uint64_t last;
++	uint64_t now;
++
++	if (dp_rx_back_n > 0) {
++		dp_rx_post();
++	}
++	now = ms_now();
++	if (sta_cstate == ST_CONNECTED && now - last >= 30000) {
++		last = now;
++		dp_print_stats("every 30 s");
++	}
++}
++
+ static bool
+-net_transmit(__unused mbuf_t packet, __unused size_t length)
++net_transmit(mbuf_t packet, size_t length)
+ {
+-	return false;                           /* no data path yet */
++	static unsigned dumped;
++
++	if (dp_tx == 0 || sta_cstate != ST_CONNECTED || length < 14 || length > REDWOOD_NET_FRAME_MAX) {
++		return false;
++	}
++	int b = dp_tx_get();
++	if (b < 0) {
++		dp_st.tx_full++;
++		return false;
++	}
++	uint8_t *p = (uint8_t *)(dp_tx + (vm_offset_t)b * DP_BUF);
++	uint32_t a = CP_ADDR(dp_tx_pa + (uint64_t)b * DP_BUF);
++	uint8_t d[16];
++	bzero(d, sizeof(d));
++	put5(d, a);
++	d[5] = (uint8_t)(2 | (sta_ctx & 7) << 5);       /* data */
++	d[6] = 11;
++	d[8] = (uint8_t)length;
++	d[9] = (uint8_t)(length >> 8);
++	d[11] = sta_lut != 0xff ? sta_lut : 6;
++	memcpy(p, d, 16);
++	if (mbuf_copydata(packet, 0, length, p + 16) != 0) {
++		lck_mtx_lock(&dp_tx_lock);
++		dp_tx_busy[b] = 0;
++		lck_mtx_unlock(&dp_tx_lock);
++		return false;
++	}
++	if (p[16 + 12] == 0x08 && p[16 + 13] == 0x06) {
++		p[7] = 1u << 2;                         /* ARP: sw_rate, as the vendor's is_special_data */
++	}
++	__builtin_arm_dsb(0xf);
++
++	uint8_t m[7 + 5];
++	m[0] = (uint8_t)(4 | 1u << 4 | (sta_ctx & 7) << 5);   /* type 4, buffer_type 1, interface */
++	m[1] = 7;
++	m[2] = 0x80;                                    /* buffer_inuse */
++	m[3] = 1;
++	m[4] = 0;
++	m[5] = 0;
++	m[6] = 0;
++	put5(m + 7, a);
++	if (dumped < 3) {
++		dumped++;
++		w_hexdump("data tx", p, MIN((uint32_t)length + 16, 64u));
++	}
++	if (!agm_sipc_data_send(m, sizeof(m))) {
++		lck_mtx_lock(&dp_tx_lock);
++		dp_tx_busy[b] = 0;
++		lck_mtx_unlock(&dp_tx_lock);
++		dp_st.tx_fail++;
++		return false;
++	}
++	dp_st.tx++;
++	if ((dp_st.tx & 1023) == 0) {
++		dp_print_stats("every 1024 sent");
++	}
++	return true;
+ }
+ 
+ static struct redwood_net_link net_link = {
+@@ -1177,41 +1494,33 @@ mac_from_boot_arg(void)
+ }
+ 
+ /*
+- * From the SIPC thread: a block the firmware put on a data channel (8 or 9). "Special data" (the first word an
+- * rx_msdu_desc: host_type:4 = 3, ctx_id:4, msdu_offset:8, msdu_len:16; 28 bytes of it, then the 802.11 header)
+- * carries the frame itself at msdu_offset, as Ethernet: EAPOL goes to the handshake thread. The rest is
+- * logged, so the data path's formats can be read before it is written.
++ * From the SIPC thread: a block the firmware put on a data channel (8 or 9), by its first byte's type:
++ *   3 "special data": an rx_msdu_desc (host_type:4, ctx_id:4, msdu_offset:8, msdu_len:16; 28 bytes) and the
++ *     802.11 header, the frame itself as Ethernet at msdu_offset (EAPOL, ARP, ...);
++ *   4 an address message: RX buffers filled (reserv bit set) or TX buffers done (not set).
+  */
+ void agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len);
+ void
+ agm_wifi_data_msg(int channel, const uint8_t *msg, uint32_t len)
+ {
+-	static unsigned seen[2];
+-	int k = channel == 9 ? 1 : 0;
++	static unsigned seen;
+ 
+ 	if (len >= 28 && (msg[0] & 0xf) == 3) {
+ 		uint32_t off = msg[1], mlen = (uint32_t)msg[2] | (uint32_t)msg[3] << 8;
+ 		if (off >= 28 && off + mlen <= len && mlen >= 14) {
+-			const uint8_t *e = msg + off;
+-			static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
+-			if (e[12] == 0x88 && e[13] == 0x8e) {
+-				eapol_queue(e, mlen);
+-				return;
+-			}
+-			if (memcmp(e, snap, 8) == 0 && mlen > 8 && mlen - 8 + 14 <= EQ_FRAME_MOST) {
+-				/* not converted: LLC/SNAP right after the 802.11 header (addr1 at +4, addr3 at +16) */
+-				uint8_t f[EQ_FRAME_MOST];
+-				memcpy(f, msg + 28 + 4, 6);
+-				memcpy(f + 6, (msg[28 + 1] & 2) ? msg + 28 + 16 : msg + 28 + 10, 6);
+-				f[12] = 0x88;
+-				f[13] = 0x8e;
+-				memcpy(f + 14, e + 8, mlen - 8);
+-				eapol_queue(f, mlen - 8 + 14);
+-				return;
+-			}
++			memcpy(dp_frame, msg + off, MIN(mlen, (uint32_t)sizeof(dp_frame)));
++			dp_deliver(dp_frame, MIN(mlen, (uint32_t)sizeof(dp_frame)));
++			return;
++		}
++	} else if (len >= 1 && (msg[0] & 7) == 4) {
++		if (msg[0] & 8) {
++			dp_rx_event(msg, len);
++		} else {
++			dp_tx_done(msg, len);
+ 		}
++		return;
+ 	}
+-	if (seen[k]++ < 12) {
++	if (seen++ < 12) {
+ 		char line[3 * 48 + 1];
+ 		unsigned n = 0;
+ 		for (uint32_t i = 0; i < len && i < 48; i++) {
+@@ -1292,6 +1601,16 @@ agm_wifi_bring_up(void)
+ 	sta_ctx = rlen >= 1 ? buf[0] : 0;
+ 	printf("AGM WIFI: station open, ctx %u\n", sta_ctx);
+ 
++	/* the RX buffers, all of them, as the vendor's sprdwl_mm_fill_all_buffer() after OPEN */
++	if (dp_init()) {
++		for (unsigned i = 0; i < DP_RX_N; i++) {
++			dp_rx_back[dp_rx_back_n++] = (uint16_t)(DP_RX_N - 1 - i);
++		}
++		dp_rx_post();
++		printf("AGM WIFI: data path: %u RX buffers given at %#llx, %u TX buffers at %#llx\n",
++		    (unsigned)dp_st.rx_posted, (unsigned long long)dp_rx_pa, DP_TX_N, (unsigned long long)dp_tx_pa);
++	}
++
+ 	w_crypto_selftest();
+ 	thread_t th;
+ 	if (kernel_thread_start(hs_thread, NULL, &th) == KERN_SUCCESS) {
+-- 
+2.39.5 (Apple Git-154)
+

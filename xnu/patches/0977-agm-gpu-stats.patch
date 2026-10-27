@@ -1,0 +1,143 @@
+agm-0977: AgmMaliGPU statistics every 5 s: how long the GPU was busy and on
+how many jobs, how many waits for it (WAIT_BO, sync objects) and how long they took, how many
+buffers were made, how big and how long it took.
+
+diff --git a/iokit/Kernel/arm/AgmMali.cpp b/iokit/Kernel/arm/AgmMali.cpp
+index 433689755..1424422bf 100644
+--- a/iokit/Kernel/arm/AgmMali.cpp
++++ b/iokit/Kernel/arm/AgmMali.cpp
+@@ -54,6 +54,7 @@ void agm_mali_flush(uint64_t va, uint64_t size);
+ uint64_t agm_mali_submit(uint64_t jc, uint32_t requirements);
+ bool agm_mali_done(uint64_t seqno);
+ uint64_t agm_mali_last(void);
++void agm_mali_busy(uint64_t *ns, uint64_t *jobs);
+ bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
+ void agm_mali_init(void);
+ void agm_mali_selftest(void);
+@@ -200,6 +201,7 @@ static uint32_t ring_head, ring_count;
+ static uint32_t running_slot;
+ static uint64_t running_since;
+ static uint64_t jobs_done, jobs_failed;
++static uint64_t busy_abs, busy_jobs;           /* since agm_mali_busy() was last asked: the GPU at work (as seen here) */
+ static thread_t kick_thread;
+ 
+ static inline uint32_t
+@@ -738,6 +740,8 @@ check(void)
+ 		} else {
+ 			jobs_done++;
+ 		}
++		busy_abs += mach_absolute_time() - running_since;
++		busy_jobs++;
+ 		wr(JOB_INT_CLEAR, (1u << slot) | (1u << (16 + slot)));
+ 		done_seqno = running_seqno;
+ 		running_seqno = 0;
+@@ -788,6 +792,18 @@ agm_mali_done(uint64_t seqno)
+ 	return done;
+ }
+ 
++/* How long the GPU has been at work, and on how many jobs, since the last time this was asked. */
++void
++agm_mali_busy(uint64_t *ns, uint64_t *jobs)
++{
++	IOLockLock(hw_lock);
++	absolutetime_to_nanoseconds(busy_abs, ns);
++	*jobs = busy_jobs;
++	busy_abs = 0;
++	busy_jobs = 0;
++	IOLockUnlock(hw_lock);
++}
++
+ uint64_t
+ agm_mali_last(void)
+ {
+diff --git a/iokit/Kernel/arm/AgmMaliGPU.cpp b/iokit/Kernel/arm/AgmMaliGPU.cpp
+index 966559839..df8bd939d 100644
+--- a/iokit/Kernel/arm/AgmMaliGPU.cpp
++++ b/iokit/Kernel/arm/AgmMaliGPU.cpp
+@@ -60,6 +60,7 @@ void agm_mali_flush(uint64_t va, uint64_t size);
+ uint64_t agm_mali_submit(uint64_t jc, uint32_t requirements);
+ bool agm_mali_done(uint64_t seqno);
+ uint64_t agm_mali_last(void);
++void agm_mali_busy(uint64_t *ns, uint64_t *jobs);
+ bool agm_mali_wait(uint64_t seqno, uint64_t milliseconds);
+ void agm_mali_init(void);
+ 
+@@ -149,6 +150,8 @@ static IOLock *gLock;
+ static struct {
+ 	uint64_t since, flushing, flushed;
+ 	uint32_t submissions;
++	uint64_t waiting, making, made_bytes;   /* (mach time; bytes) */
++	uint32_t waits, made, given_back;
+ } gStat;                                        /* the last five seconds' submissions, for the log */
+ 
+ struct gpu_buffer {
+@@ -383,6 +386,7 @@ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ 	if (size == 0 || size > GPU_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
++	uint64_t made_began = mach_absolute_time();
+ 	/*
+ 	 * From the GPU pool (RAM the kernel does not manage, write-combined for the kernel and for
+ 	 * programs alike: nothing of it is ever in the processors' caches). The heap, which only
+@@ -430,6 +434,9 @@ AgmMaliGPUUserClient::createBo(struct pan_create_bo *r)
+ 		b->cached = pool == 0 && !heap;
+ 		b->pool = pool;
+ 		r->offset = b->address;
++		gStat.made++;
++		gStat.made_bytes += size;
++		gStat.making += mach_absolute_time() - made_began;
+ 	}
+ 	IOLockUnlock(gLock);
+ 	if (b == NULL) {
+@@ -566,10 +573,17 @@ AgmMaliGPUUserClient::submit(struct pan_submit *r)
+ 	if (ns >= 5 * NSEC_PER_SEC) {
+ 		uint64_t flushing;
+ 		absolutetime_to_nanoseconds(gStat.flushing, &flushing);
++		uint64_t waiting, making, busy, jobs;
++		absolutetime_to_nanoseconds(gStat.waiting, &waiting);
++		absolutetime_to_nanoseconds(gStat.making, &making);
++		agm_mali_busy(&busy, &jobs);
+ 		IOLog("AgmMaliGPU: %u submissions in %llu ms; %llu KB out of the caches in %llu us a submission; "
+ 		    "%u buffers (%llu MB) with this client\n", gStat.submissions, ns / NSEC_PER_MSEC,
+ 		    (gStat.flushed >> 10) / gStat.submissions, flushing / NSEC_PER_USEC / gStat.submissions, fBufferCount,
+ 		    fBufferBytes >> 20);
++		IOLog("AgmMaliGPU: the GPU busy %llu ms on %llu jobs; %u waits for it, %llu ms in all; %u buffers made "
++		    "(%llu MB) in %llu ms, %u given back\n", busy / NSEC_PER_MSEC, jobs, gStat.waits, waiting / NSEC_PER_MSEC,
++		    gStat.made, gStat.made_bytes >> 20, making / NSEC_PER_MSEC, gStat.given_back);
+ 		bzero(&gStat, sizeof(gStat));
+ 	}
+ 	if (fSubmits++ < 4) {
+@@ -627,7 +641,7 @@ AgmMaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct gpu_buffer *b;
+-	uint64_t seqno;
++	uint64_t seqno, waitBegan = 0;
+ 	IOReturn ret = kIOReturnSuccess;
+ 
+ 	(void)dispatch;
+@@ -667,6 +681,7 @@ AgmMaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		ret = submit(&r.submit);
+ 		break;
+ 	case kPanWaitBo:
++		waitBegan = mach_absolute_time();
+ 		IOLockLock(gLock);
+ 		b = buffer(r.waitBo.handle);
+ 		seqno = b != NULL ? b->seqno : 0;
+@@ -684,11 +699,16 @@ AgmMaliGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 			}
+ 			IOLockUnlock(gLock);
+ 		}
++		gStat.waits++;
++		gStat.waiting += mach_absolute_time() - waitBegan;
+ 		break;
+ 	case kAgmWaitSeqno:
++		waitBegan = mach_absolute_time();
+ 		if (r.waitSeqno.seqno != 0 && !agm_mali_wait(r.waitSeqno.seqno, milliseconds(r.waitSeqno.timeout_ns))) {
+ 			ret = kIOReturnTimeout;
+ 		}
++		gStat.waits++;
++		gStat.waiting += mach_absolute_time() - waitBegan;
+ 		break;
+ 	case kPanMadvise:
+ 		r.madvise.retained = 1;
