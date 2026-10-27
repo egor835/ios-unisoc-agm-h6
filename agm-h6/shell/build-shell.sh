@@ -22,7 +22,7 @@ git checkout -q "$REV"
 make clean >/dev/null 2>&1 || true
 make macos_defconfig >/dev/null
 # the shell and a few extras on top of the macOS set (toysh is in pending/)
-for c in SH SHIFT VI SYNC; do sed -i "/CONFIG_$c is not set/d; /^CONFIG_$c=/d" .config; echo "CONFIG_$c=y" >> .config; done
+for c in SH SHIFT VI SYNC TR AWK; do sed -i "/CONFIG_$c is not set/d; /^CONFIG_$c=/d" .config; echo "CONFIG_$c=y" >> .config; done
 yes "" 2>/dev/null | make oldconfig >/dev/null 2>&1 || true   # yes ends by SIGPIPE
 # the iOS SDK has no sys/disk.h (lib/portability.c, block device size): borrow the macOS one
 mkdir -p ios-inc/sys

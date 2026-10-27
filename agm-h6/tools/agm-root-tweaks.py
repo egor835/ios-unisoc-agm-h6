@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AGM H6 additions on top of ios-topaz tools/sweet-root-tweaks.py.
 
-  sudo agm-root-tweaks.py MOUNTED_ROOT [SHELL_DIR]
+  sudo agm-root-tweaks.py MOUNTED_ROOT [SHELL_DIR] [--apps=copy|migrate]
 
 Run as root on the HFS+ root image mounted read-write. Idempotent.
 
@@ -13,6 +13,15 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
               progress-bar migration starts again on every boot and never ends
               within the bootloader watchdog's ~5 minutes on one core.
               Also com.apple.DataMigration.plist (topaz image v10).
+  apps        the 32 removable stock apps (Notes, Calculator, Mail, ...) come in
+              /private/var/staged_system_apps; on an iPhone DataMigration's
+              SystemAppMigrator installs them at the first boot.
+              --apps=copy (default): migration stays off (as above) and the apps are
+              copied into /Applications, where LaunchServices finds them.
+              --apps=migrate: no migration state at all (also not the
+              com.apple.migration LastSystemVersion of sweet-root-tweaks.py), so
+              DataMigration runs at the first boot and installs them (and runs the
+              keyboard and other migrators); it may take long.
   launchd     fairplayd.H2 (FairPlay, needs the SEP) and bluetoothd (no
               Bluetooth here) crash and respawn every ~10 s: their jobs go.
   shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
@@ -21,6 +30,7 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
 """
 import os
 import plistlib
+import shutil
 import sys
 
 MOBILE = 501
@@ -79,6 +89,37 @@ def launchd(root):
     print("launchd.plist: removed", [label for _, label in drop] or "nothing (already gone)")
 
 
+def apps_copy(root):
+    staged = os.path.join(root, "private/var/staged_system_apps")
+    n = 0
+    for name in sorted(os.listdir(staged)):
+        dst = os.path.join(root, "Applications", name)
+        if name.endswith(".app") and not os.path.exists(dst):
+            shutil.copytree(os.path.join(staged, name), dst, symlinks=True, copy_function=shutil.copy2)
+            n += 1
+            for d, dirs, files in os.walk(dst):           # copytree keeps modes, not owners
+                src_d = os.path.join(staged, os.path.relpath(d, os.path.join(root, "Applications")))
+                for e in dirs + files:
+                    st = os.lstat(os.path.join(src_d, e))
+                    os.lchown(os.path.join(d, e), st.st_uid, st.st_gid)
+            st = os.stat(os.path.join(staged, name))
+            os.chown(dst, st.st_uid, st.st_gid)
+    print("apps: %d staged apps copied into /Applications" % n)
+
+
+def migration_on(root):
+    prefs = os.path.join(root, "private/var/mobile/Library/Preferences")
+    gone = []
+    for rel in ["com.apple.migration.plist", "com.apple.DataMigration.plist",
+                "ByHost/com.apple.migration.%s.plist" % PLATFORM_UUID,
+                "ByHost/com.apple.migration.%s.plist" % PLATFORM_UUID.lower()]:
+        path = os.path.join(prefs, rel)
+        if os.path.exists(path):
+            os.unlink(path)
+            gone.append(rel)
+    print("migration: on at the first boot; removed", gone or "nothing")
+
+
 def shell(root, shell_dir):
     for name in ("toybox", "agm-shelld"):
         dst = os.path.join(root, "usr/bin", name)
@@ -101,17 +142,25 @@ def shell(root, shell_dir):
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or not os.path.isdir(os.path.join(sys.argv[1], "System/Library/xpc")):
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+    apps = opts.get("apps", "copy")
+    if len(args) not in (1, 2) or apps not in ("copy", "migrate") or \
+            not os.path.isdir(os.path.join(args[0], "System/Library/xpc")):
         sys.exit(__doc__)
     if os.geteuid() != 0:
         sys.exit("run as root (files must be owned by mobile/root)")
-    root = sys.argv[1]
+    root = args[0]
     build = build_version(root)
     print("build", build)
-    migration(root, build)
+    if apps == "migrate":
+        migration_on(root)
+    else:
+        migration(root, build)
+        apps_copy(root)
     launchd(root)
-    if len(sys.argv) == 3:
-        shell(root, sys.argv[2])
+    if len(args) == 2:
+        shell(root, args[1])
 
 
 if __name__ == "__main__":

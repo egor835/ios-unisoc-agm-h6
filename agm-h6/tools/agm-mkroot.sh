@@ -1,6 +1,9 @@
 #!/bin/bash
 # Build the AGM H6 iOS root image from scratch, from the iPhone X (iPhone10,3/10,6) 16.7.16 IPSW:
-#   sudo -v; tools/agm-mkroot.sh IPSW OUT.img [SIZE]        (SIZE default 16G)
+#   sudo -v; [AGM_APPS=copy|migrate] tools/agm-mkroot.sh IPSW OUT.img [SIZE]     (SIZE default 16G)
+# AGM_APPS: how the stock apps from /private/var/staged_system_apps get in (tools/agm-root-tweaks.py):
+# migrate (default) = DataMigration at the first boot installs them, as on an iPhone (works on AGM
+# since the 8 cores and the kernel-fed watchdog); copy = into /Applications with migration off.
 # Linux, needs: apfs-fuse, hfsprogs (mkfs.hfsplus, fsck.hfsplus), rsync, python3, unzip, sudo.
 # Steps: the OS / SystemOS / AppOS images named by the IPSW's BuildManifest -> ../tools/mkiosroot.sh
 # (topaz: HFS+ image with the cryptexes inside) -> ../tools/sweet-root-tweaks.py (topaz bring-up
@@ -39,10 +42,10 @@ mkdir -p "$mnt"
 sudo mount -t hfsplus -o loop,force "$out" "$mnt"
 sudo python3 -I "$topaz/tools/sweet-root-tweaks.py" "$mnt"
 if [ -x "$here/shell/out/agm-shelld" ]; then
-	sudo python3 -I "$here/tools/agm-root-tweaks.py" "$mnt" "$here/shell/out"
+	sudo python3 -I "$here/tools/agm-root-tweaks.py" "$mnt" "$here/shell/out" --apps="${AGM_APPS:-migrate}"
 else
 	echo "(no shell/out: run shell/build-shell.sh first for the root shell)"
-	sudo python3 -I "$here/tools/agm-root-tweaks.py" "$mnt"
+	sudo python3 -I "$here/tools/agm-root-tweaks.py" "$mnt" --apps="${AGM_APPS:-migrate}"
 fi
 sudo umount "$mnt"
 sudo fsck.hfsplus -fy "$out" >/dev/null || true

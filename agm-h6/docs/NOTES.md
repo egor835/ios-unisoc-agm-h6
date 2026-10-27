@@ -129,3 +129,10 @@
   - PIO-чтение FIFO OUT-endpoint'а даёт нули (правильная длина; EP0 читается нормально). Вендор всегда использует свой DMA → bulk OUT через DMA-канал ep+15 (16), один узел V3 16 Б {addr, 32 | blk_len<<16, list_end|ioc|addr[35:32]<<8, 0}, RXCSR = 0xa800, готовность — CHN_INTR бит 18, длина = blk_len − CHN_LEN[31:16]. Канал останавливается на коротком пакете.
   - PIO-запись в двойной буфер IN FIFO портит многопакетные кадры (ICMP csum errors на ПК) → EP1 TX одинарный буфер (TX_DPKTBUFDIS бит 1) и загрузка только при пустом FIFO (TXPKTRDY|FIFONOTEMPTY = 0).
 - Сборка ядра AGM только с `SWEET_AGM=1 tools/build-local.sh` (без флага AGM-код не компилируется, ошибки нет).
+
+## Шелл и стоковые приложения (2026-10-28)
+- Root-шелл: `agm-shelld` (TCP 2323, pty, toybox sh из `shell/build-shell.sh`, ad-hoc подпись с platform-application), задание launchd `com.agm.shelld`; на ПК `tools/agm-sh.sh`. В образ ставится `tools/agm-root-tweaks.py ROOT shell/out`.
+- 32 удаляемых приложения (Notes, Calculator, Mail, Calendar, Weather, Files, Music…) лежат в `/private/var/staged_system_apps`; в `/System/Library/AppPlaceholders` — только заглушки. Ставит их миграция (`SystemAppMigrator`) при первой загрузке в `/var/containers/Bundle/Application`.
+- topaz глушит миграцию тремя файлами в `/var/mobile/Library/Preferences`: `com.apple.migration.plist` (LastSystemVersion, sweet-root-tweaks.py), `ByHost/com.apple.migration.<UUID>.plist` и `com.apple.DataMigration.plist` (agm-root-tweaks.py). Без всех трёх (+ `com.apple.migrationpluginwrapper.plist`) на 8 ядрах миграция за несколько минут ставит все 32 приложения и пишет своё состояние. Без первого файла `datamigrator` стартует и сразу выходит.
+- Запасной путь: скопировать `.app` из staged в `/Applications` и убрать базу LaunchServices (`…/InternalDaemon/<UUID>/Library/Caches/*LaunchServices*.csstore`) — тоже работает (`--apps=copy`).
+- Перезагрузка по USB до 0990 (`PE_halt_restart`) теряла несохранённые изменения HFS: после правок корня ждать ≥60 с или перезагружаться ядром 0990+ (`reboot_kernel`).
