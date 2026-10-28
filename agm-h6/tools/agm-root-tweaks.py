@@ -24,6 +24,8 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
               keyboard and other migrators); it may take long.
   launchd     fairplayd.H2 (FairPlay, needs the SEP) and bluetoothd (no
               Bluetooth here) crash and respawn every ~10 s: their jobs go.
+              vmd (visual voicemail, no telephony), syncdefaultsd (iCloud KVS,
+              crash loop) and wifip2pd (AWDL) spin and heat the phone: disabled.
   shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
               /usr/bin/agm-shelld, and a launchd job for agm-shelld (root shell on TCP
               port 2323, over USB Ethernet: tools/agm-sh.sh).
@@ -36,6 +38,8 @@ import sys
 MOBILE = 501
 PLATFORM_UUID = "601DEC1A-A4FC-5FEE-B42B-74463E68D152"
 DROP_PROGRAMS = {"fairplayd.H2", "bluetoothd"}
+# spin without telephony / AWDL / iCloud and keep CPUs busy (heat): disabled
+DISABLE_PROGRAMS = {"vmd", "syncdefaultsd", "wifip2pd"}
 
 
 def save(path, data, uid, gid, mode):
@@ -85,6 +89,11 @@ def launchd(root):
             drop.append((key, job.get("Label")))
     for key, _ in drop:
         del jobs[key]
+    for key, job in jobs.items():
+        prog = job.get("Program") or (job.get("ProgramArguments") or [""])[0]
+        if os.path.basename(prog) in DISABLE_PROGRAMS:
+            job["Disabled"] = True
+            print("launchd.plist: disabled", job.get("Label"))
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print("launchd.plist: removed", [label for _, label in drop] or "nothing (already gone)")
 
