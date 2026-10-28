@@ -1,0 +1,97 @@
+From 4803dd0630a2bdf9c8f8b485205c01007eb775e3 Mon Sep 17 00:00:00 2001
+From: cunny <cunny@MacbookAirM1.lan>
+Date: Wed, 28 Oct 2026 05:08:06 +0300
+Subject: [PATCH] agm 0992: present the AGM panel as 750x1624 = 375x812 points
+ @2x (iPhone X points), panel window at (12, 6); touch mapped the same (status
+ bar, keyboard 123 key)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 26 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/hid/SweetHID.cpp     | 11 +++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 43538bf9c..4a3a302d2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -140,8 +140,19 @@ enum {
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
++#if defined(SWEET_AGM)
++/*
++ * AGM H6: the 720x1612 panel at scale 2 (ADT display-scale) is 360x806 points, no iPhone: presented as
++ * 750x1624 = 375x812 points @2x, the iPhone X's point size, of which the centered 720x1612 (from
++ * x 12, y 6) is shown. With 360x806 UIKit drew the red rdar://45025538 bar and the keyboard's
++ * "123" key did not respond.
++ */
++#define SWEET_FB_LOGICAL_W              750
++#define SWEET_FB_LOGICAL_H              1624
++#else
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#endif
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -181,6 +192,7 @@ public:
+ 	volatile uint32_t *fCtl0;
+ 	volatile uint32_t *fDpu;        /* AGM H6: the Unisoc DPU (r6p0) when it can scan our surfaces itself */
+ 	uint32_t      fDpuLay;          /* ... byte offset of the layer that shows the boot framebuffer */
++	uint32_t      fDpuCrop;         /* ... CROP_START (y << 16 | x) for the next scanFrom, then 0 again */
+ 	bool          hasScanout(void) const { return fVig0 != NULL || fDpu != NULL; }
+ 	volatile uint32_t *fPwm;        /* AGM H6: the backlight's PWM channel (sprd PWM 0x643f0000, channel 2) */
+ 	uint32_t      fPwmMod;          /* ... its period in counter steps (u-boot's) */
+@@ -988,6 +1000,8 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 		/* dpu_r5p0.c: layer address and pitch (pixels), then DPU_CTRL REG_UPDATE: taken at the next vsync */
+ 		fDpu[(fDpuLay + 0x00) / 4] = (uint32_t)pa;
+ 		fDpu[(fDpuLay + 0x18) / 4] = stride / 4;
++		fDpu[(fDpuLay + 0x2c) / 4] = fDpuCrop;          /* the panel window inside a larger surface */
++		fDpuCrop = 0;
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		fDpu[0x1e4 / 4] = 1u << 4;              /* INT_CLR: UPDATE_DONE */
+ 		fDpu[0x04 / 4] |= 1u << 2;
+@@ -1457,6 +1471,18 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				 */
+ 				if (s->gpuPool) {
+ 					/* GPU pool memory (write-combined): the MDP scans the surface itself, no copy */
++#if defined(SWEET_AGM)
++					if (fDpu != NULL) {
++						/* the DPU takes the window by CROP_START from the surface's start (dpu_r5p0.c) */
++						fDpuCrop = (oy << 16) | ox;
++						static uint32_t told;
++						if (told++ < 3) {
++							IOLog("SWEET FB: DPU scans surface %ux%u at %#llx, %u bytes a row, crop %u,%u\n", s->width,
++							    s->height, s->scanoutPhys + s->offset, s->bytesPerRow, ox, oy);
++						}
++						scanFrom(s->scanoutPhys + s->offset, s->bytesPerRow);
++					} else
++#endif
+ 					scanFrom(pa, s->bytesPerRow);
+ 				} else if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index d2f4fa170..e960a2204 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -466,6 +466,17 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++#if defined(SWEET_AGM)
++	if (fLogicalW != 1080) {
++		/*
++		 * AGM: x, y arrive scaled to 1080x2400 from the 720x1612 panel; the display is 750x1624 with
++		 * the panel at (12, 6) (SweetFramebuffer.cpp: offsets rounded as there).
++		 */
++		int64_t px = (int64_t)x * 720 / 1080, py = (int64_t)y * 1612 / 2400;
++		nx = (IOFixed)(((px + ((750 - 720) / 2 & ~3)) << 16) / 750);
++		ny = (IOFixed)(((py + (1624 - 1612) / 2) << 16) / 1624);
++	}
++#endif
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+-- 
+2.39.5 (Apple Git-154)
+

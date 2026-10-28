@@ -26,6 +26,9 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
               Bluetooth here) crash and respawn every ~10 s: their jobs go.
               vmd (visual voicemail, no telephony), syncdefaultsd (iCloud KVS,
               crash loop) and wifip2pd (AWDL) spin and heat the phone: disabled.
+  plug-ins    BackgroundTaskAgent (UserEventAgent) and BTAudioHALPlugin (mediaserverd)
+              retry the missing CommCenter / bluetoothd without pause: moved to
+              *.disabled next to their directories.
   shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
               /usr/bin/agm-shelld, and a launchd job for agm-shelld (root shell on TCP
               port 2323, over USB Ethernet: tools/agm-sh.sh).
@@ -129,6 +132,23 @@ def migration_on(root):
     print("migration: on at the first boot; removed", gone or "nothing")
 
 
+# plug-ins that retry a missing daemon in a tight loop (tens of thousands of times a second):
+# BackgroundTaskAgent (UserEventAgent) looks up CommCenter's com.apple.commcenter.xpc -> launchd ~75% CPU;
+# BTAudioHALPlugin (mediaserverd) reconnects to bluetoothd -> mediaserverd ~50% CPU
+PLUGINS_OFF = ["System/Library/UserEventPlugins/com.apple.BackgroundTaskAgentPlugin.plugin",
+               "System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver"]
+
+
+def plugins_off(root):
+    for rel in PLUGINS_OFF:
+        src = os.path.join(root, rel)
+        dst_dir = os.path.dirname(src) + ".disabled"
+        if os.path.exists(src):
+            os.makedirs(dst_dir, exist_ok=True)
+            os.rename(src, os.path.join(dst_dir, os.path.basename(src)))
+            print("plug-in off:", rel)
+
+
 def shell(root, shell_dir):
     for name in ("toybox", "agm-shelld"):
         dst = os.path.join(root, "usr/bin", name)
@@ -168,6 +188,7 @@ def main():
         migration(root, build)
         apps_copy(root)
     launchd(root)
+    plugins_off(root)
     if len(args) == 2:
         shell(root, args[1])
 
