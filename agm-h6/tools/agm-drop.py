@@ -5,8 +5,8 @@ usage: agm-drop.py LOCAL=/ios/path[:MODE[:UID[:GID]]] ...   (MODE octal, default
        root:wheel, needs a kernel with patch 0989; GID defaults to UID)
        agm-drop.py --clear                         (zero the drop header: nothing is dropped)
 
-The drop is written into the partition iosroot at 32 GiB (block 8388608 of 4096 bytes), after
-the 16 GiB iOS volume and far before the console log at the partition's end; the kernel's
+The drop is written into the partition iosroot 2 GiB before its end (block 33030144 of 4096 bytes),
+in the tail that the kernel (0995+) keeps out of the file system, before the dumps and the console log; the kernel's
 bsd/dev/agm_dropbox.c (patch 0970) writes the files into place at the next iOS boot, once per
 generation (the time of this run). Checks before writing: iosroot is /dev/block/by-name/iosroot,
 128 GiB exactly; the drop fits in 1 GiB. Afterwards the blocks are read back and compared.
@@ -21,7 +21,7 @@ import time
 
 PART = "/dev/block/by-name/iosroot"
 PART_BYTES = 128 << 30
-OFF = 32 << 30
+OFF = PART_BYTES - (2 << 30)          # the reserved tail (kernel 0995+; before: 32 GiB)
 BLOCK = 4096
 MAX = 1 << 30
 ENTRIES = 31

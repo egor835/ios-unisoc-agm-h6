@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the shell userland for the AGM H6 iOS root on the Mac build host:
-# toybox (sh, vi, coreutils-like applets) and agm-shelld (root shell over TCP port 2323), ad-hoc signed.
+# toybox (sh, vi, coreutils-like applets), agm-shelld (root shell over TCP port 2323) and hfsgrow (grows
+# the root volume over its partition), ad-hoc signed.
 #   shell/build-shell.sh            -> shell/out/{toybox,agm-shelld}
 # Env: MAC=user@host of the Mac (Xcode with the iPhoneOS SDK, Homebrew), TOYBOX_REV (default 6a0c0ef).
 set -euo pipefail
@@ -8,7 +9,7 @@ cd "$(dirname "$0")"
 MAC=${MAC:?set MAC=user@host of the Mac build host}
 REV=${TOYBOX_REV:-6a0c0ef}
 mkdir -p out
-scp -q agm-shelld.c ents.plist "$MAC:/tmp/"
+scp -q agm-shelld.c hfsgrow.c ents.plist "$MAC:/tmp/"
 ssh "$MAC" REV="$REV" bash -s <<'MACEOF'
 set -euo pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -34,7 +35,8 @@ CC="$(xcrun -sdk iphoneos -f clang)" CFLAGS="$F -I$PWD/ios-inc" LDFLAGS="$F" HOS
 cp toybox /tmp/toybox && chmod u+w /tmp/toybox
 cd /tmp
 xcrun -sdk iphoneos clang $F -O2 -Wall -o agm-shelld agm-shelld.c
-for f in toybox agm-shelld; do codesign -f -s - --entitlements ents.plist $f; done
+xcrun -sdk iphoneos clang $F -O2 -Wall -o hfsgrow hfsgrow.c
+for f in toybox agm-shelld hfsgrow; do codesign -f -s - --entitlements ents.plist $f; done
 MACEOF
-scp -q "$MAC:/tmp/toybox" "$MAC:/tmp/agm-shelld" out/
+scp -q "$MAC:/tmp/toybox" "$MAC:/tmp/agm-shelld" "$MAC:/tmp/hfsgrow" out/
 ls -la out/

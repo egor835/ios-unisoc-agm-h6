@@ -157,3 +157,7 @@
 - `/var/mobile/tmp` обязателен: без него URLSession у приложений без контейнера падает «No such file or directory» (Sileo: «Release returned status 200 …»).
 - toybox: `nc -l` читает терминал и обрывает приём — `< /dev/null`; `tar` из канала теряет хвост — распаковывать из файла; `sh` (toysh) зависает на части конструкций — с бутстрапом шелл = bash.
 - Службы бутстрапа (sshd) launchd из `launchd.plist` не берёт (пути вне /System) — `agm-shelld` при старте делает `launchctl load /var/jb/Library/LaunchDaemons`; при первой загрузке нового образа — `/var/jb/.agm-firstboot.sh` (prep_bootstrap, пароли, dpkg -i Sileo, uicache).
+
+## Раздел iosroot: 126 ГиБ под корень (0995, 2026-10-28)
+- Раскладка iosroot (128 ГиБ): HFS+ — первые 126 ГиБ; последние 2 ГиБ — служебный хвост: dropbox с «конец − 2 ГиБ» (блок 33030144 по 4096), дампы `sweet_ufs_dump` с «конец − 1 ГиБ» (блок 33292288, 64 МиБ: `dd if=/dev/block/by-name/iosroot bs=4096 skip=33292288`), лог ядра — последние 4100 КиБ (как раньше). До 0995 dropbox и дампы были на 32/33 ГиБ — после расширения ФС там данные, старые смещения не использовать.
+- Ядро отдаёт HFS число блоков без хвоста (DKIOCGETBLOCKCOUNT), поэтому том можно растянуть на всё остальное: `hfsgrow max` (fsctl HFSIOC_RESIZE_VOLUME на «/», hfs_extendfs) — на живой системе за доли секунды. `agm-shelld` вызывает его при каждом старте (тихо, если уже максимум): свежий 16-ГиБ образ растягивается сам.

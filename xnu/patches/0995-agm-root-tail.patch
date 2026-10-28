@@ -1,0 +1,92 @@
+From 810f83d6d3c4dd6816103a64c5d9bb622ad9986f Mon Sep 17 00:00:00 2001
+From: cunny <cunny@MacbookAirM1.lan>
+Date: Wed, 28 Oct 2026 11:29:01 +0300
+Subject: [PATCH] agm 0995: reserve the last 2 GiB of the root partition (drop
+ box, dumps, log) and leave them out of the block count, so the HFS volume can
+ grow over the rest
+
+---
+ bsd/dev/agm_dropbox.c |  5 +++--
+ bsd/dev/sweet_ufs.c   | 26 +++++++++++++++++++++++---
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/dev/agm_dropbox.c b/bsd/dev/agm_dropbox.c
+index 6467f7545..aac0e70af 100644
+--- a/bsd/dev/agm_dropbox.c
++++ b/bsd/dev/agm_dropbox.c
+@@ -2,7 +2,7 @@
+  * AGM H6: files for the iOS root, dropped from Android (agm-h6/tools/agm-drop.py).
+  *
+  * The iOS volume takes the first 16 GiB of the 128 GiB partition iosroot; the console log the
+- * last 4100 KiB. At AGM_DROP_OFF (32 GiB) there may be a drop: a 4096-byte header ("AGMDROP1",
++ * last 4100 KiB. At AGM_DROP_OFF (the partition's end - 2 GiB, from 0995; 32 GiB before) there may be a drop: a 4096-byte header ("AGMDROP1",
+  * a generation, up to 31 entries: path, mode, where in the drop and how long, an FNV-1a 64 hash
+  * of the bytes) followed by the files' bytes. Once the root is mounted read-write, a kernel
+  * thread writes every entry whose bytes hash right into its path (the directory must exist),
+@@ -29,7 +29,8 @@ extern vnode_t rootvnode;
+ void agm_dropbox_start(void);
+ 
+ #define AGM_DROP_PART           "iosroot"
+-#define AGM_DROP_OFF            (32ull << 30)
++extern uint64_t sweet_ufs_tail_offset(void);
++#define AGM_DROP_OFF            sweet_ufs_tail_offset()  /* the root partition's reserved tail (sweet_ufs.c) */
+ #define AGM_DROP_MAX            (1ull << 30)
+ #define AGM_DROP_ENTRIES        31
+ #define AGM_DROP_CHUNK          (1u << 20)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fabf40f97..7f6628684 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -438,10 +438,30 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 	return ENOENT;
+ }
+ 
++#if defined(SWEET_AGM)
++/*
++ * AGM: the root partition (iosroot, 128 GiB) ends in a reserved tail of 2 GiB that the file system never
++ * gets (the block count told to HFS leaves it out, so the volume can grow over all the rest): the drop
++ * box at the tail's start (agm_dropbox.c, 1 GiB), the dumps 1 GiB before the end (64 MiB), the console
++ * log in the last SWEET_LOG_BLOCKS. (Until 0995 the drop box and the dumps sat at 32 and 33 GiB.)
++ */
++#define SWEET_TAIL_BYTES        (2ull << 30)
++#define SWEET_TAIL_BLOCKS       (SWEET_TAIL_BYTES / UFS_BLOCK)
++#define SWEET_FS_BLOCKS         (su.nblocks > 2 * SWEET_TAIL_BLOCKS ? su.nblocks - SWEET_TAIL_BLOCKS : su.nblocks)
++#define SWEET_DUMP_OFF          (su.nblocks * UFS_BLOCK - (1ull << 30))
++uint64_t sweet_ufs_tail_offset(void);
++uint64_t
++sweet_ufs_tail_offset(void)
++{
++	return su.nblocks * UFS_BLOCK - SWEET_TAIL_BYTES;
++}
++#else
++#define SWEET_FS_BLOCKS         su.nblocks
+ #define SWEET_DUMP_OFF          (33ull << 30)
++#endif
+ #define SWEET_DUMP_MAX          (64ull << 20)
+ int sweet_ufs_dump(uint64_t off, const void *src, uint64_t len);
+-/* len bytes at 33 GiB + off of the root partition (block aligned, at most 64 MiB in all) */
++/* len bytes at SWEET_DUMP_OFF + off of the root partition (block aligned, at most 64 MiB in all) */
+ int
+ sweet_ufs_dump(uint64_t off, const void *src, uint64_t len)
+ {
+@@ -641,7 +661,7 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		*f = UFS_BLOCK;
+ 		return 0;
+ 	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++		*o = SWEET_FS_BLOCKS * UFS_BLOCK / su.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+ 		*f = su.writable;
+@@ -686,7 +706,7 @@ sweet_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+ static int
+ sweet_ufs_psize(__unused dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	return su.ready ? (int)MIN(SWEET_FS_BLOCKS * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
+ static int
+-- 
+2.39.5 (Apple Git-154)
+

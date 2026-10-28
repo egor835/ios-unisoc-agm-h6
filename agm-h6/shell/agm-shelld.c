@@ -5,7 +5,7 @@
  * Each connection gets a pty running bash from the Procursus bootstrap (/var/jb) when it is
  * installed, else toybox sh (toysh, still incomplete). At start the toybox applets are linked into
  * /var/agm/bin; PATH: the bootstrap's directories, then /var/agm/bin, then the system's.
- * Also at start, as a jailbreak's loader does: the bootstrap's own daemons (sshd...) from
+ * At start the root volume is grown over its partition (/usr/bin/hfsgrow max). Also at start, as a jailbreak's loader does: the bootstrap's own daemons (sshd...) from
  * /var/jb/Library/LaunchDaemons are loaded with its launchctl (launchd skips jobs outside /System
  * in its launchd.plist). Before that, once: /var/jb/.agm-firstboot.sh if it is there (the root image's
  * bootstrap setup that needs iOS running: prep_bootstrap.sh, Sileo's package, uicache; it removes itself).
@@ -70,6 +70,24 @@ link_applets(void)
 		}
 	}
 	fprintf(stderr, "agm-shelld: %d applets linked into " BINDIR "\n", count);
+}
+
+/* a freshly flashed 16 GiB root grows over its whole partition (hfsgrow max; quiet when it has) */
+static void
+grow_root(void)
+{
+	if (access("/usr/bin/hfsgrow", X_OK) != 0) {
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		execl("/usr/bin/hfsgrow", "hfsgrow", "max", (char *)NULL);
+		_exit(127);
+	}
+	if (pid > 0) {
+		int st;
+		waitpid(pid, &st, 0);
+	}
 }
 
 static void
@@ -174,6 +192,7 @@ main(void)
 {
 	signal(SIGPIPE, SIG_IGN);
 	link_applets();
+	grow_root();
 	run_firstboot();
 	load_jb_daemons();
 	int l = socket(AF_INET, SOCK_STREAM, 0), one = 1;

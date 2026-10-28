@@ -41,8 +41,9 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
               /Applications/Sileo.app/Sileo -> the real one (giveMeRoot's build-time path), and
               /var/jb/.agm-firstboot.sh, run once by agm-shelld at the first boot: prep_bootstrap.sh,
               passwords "alpine" for root and mobile, dpkg -i Sileo, uicache.
-  shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
-              /usr/bin/agm-shelld, and a launchd job for agm-shelld (root shell on TCP
+  shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox,
+              /usr/bin/agm-shelld and /usr/bin/hfsgrow (agm-shelld grows the 16 GiB root over its
+              partition at the first boot), and a launchd job for agm-shelld (root shell on TCP
               port 2323, over USB Ethernet: tools/agm-sh.sh).
 """
 import os
@@ -240,7 +241,7 @@ def bootstrap(root, tar_zst, sileo_deb):
 
 
 def shell(root, shell_dir):
-    for name in ("toybox", "agm-shelld"):
+    for name in ("toybox", "agm-shelld", "hfsgrow"):
         dst = os.path.join(root, "usr/bin", name)
         with open(os.path.join(shell_dir, name), "rb") as f, open(dst, "wb") as o:
             o.write(f.read())
