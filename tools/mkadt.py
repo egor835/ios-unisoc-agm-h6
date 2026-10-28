@@ -224,10 +224,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, agm=
             # --native: present the real 1080x2400 panel (needed for direct MDP scanout,
             # which must match the canvas: sweetfb_native=1 with a 1125x2436 canvas makes
             # backboardd ask for a hardware scaler that does not exist)
-            # AGM: always the native 720x1612 panel (boot with sweetfb_native=1): the
-            # 1125x2436 canvas would only show its middle through the smaller panel.
-            ('canvas-width', u32(720 if agm else 1080 if native else 1125)),
-            ('canvas-height', u32(1612 if agm else 2400 if native else 2436)),
+            # AGM: 750x1624 = 375x812 points @2x, the iPhone X point size (the kernel shows its
+            # middle 720x1612 on the panel, SweetFramebuffer.cpp); --native: the 720x1612 panel
+            # itself (boot with sweetfb_native=1; 360x806 points: UIKit has no layout data for it).
+            ('canvas-width', u32((720 if native else 750) if agm else 1080 if native else 1125)),
+            ('canvas-height', u32((1612 if native else 1624) if agm else 2400 if native else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [

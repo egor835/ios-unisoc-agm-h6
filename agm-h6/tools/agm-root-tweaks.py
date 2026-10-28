@@ -29,6 +29,8 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
   plug-ins    BackgroundTaskAgent (UserEventAgent) and BTAudioHALPlugin (mediaserverd)
               retry the missing CommCenter / bluetoothd without pause: moved to
               *.disabled next to their directories.
+  status bar  UIStatusBarVisualProviderClassName = the iPhone X's status bar (the screen is 375x812
+              points @2x, kernel 0992 + mkadt.py canvas 750x1624; no iPhone has that scale).
   shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
               /usr/bin/agm-shelld, and a launchd job for agm-shelld (root shell on TCP
               port 2323, over USB Ethernet: tools/agm-sh.sh).
@@ -149,6 +151,20 @@ def plugins_off(root):
             print("plug-in off:", rel)
 
 
+def status_bar(root):
+    """UIKit has no status bar layout for a 375x812 point screen at scale 2 (it draws the red
+    rdar://45025538 bar); it takes the class named by the UIStatusBarVisualProviderClassName default
+    instead: the iPhone X one (1125 pixels wide @3x = the same 375 points)."""
+    path = os.path.join(root, "private/var/mobile/Library/Preferences/.GlobalPreferences.plist")
+    data = {}
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+    data["UIStatusBarVisualProviderClassName"] = "_UIStatusBarVisualProvider_Split1125"
+    save(path, data, MOBILE, MOBILE, 0o600)
+    print("status bar: _UIStatusBarVisualProvider_Split1125")
+
+
 def shell(root, shell_dir):
     for name in ("toybox", "agm-shelld"):
         dst = os.path.join(root, "usr/bin", name)
@@ -189,6 +205,7 @@ def main():
         apps_copy(root)
     launchd(root)
     plugins_off(root)
+    status_bar(root)
     if len(args) == 2:
         shell(root, args[1])
 

@@ -22,7 +22,13 @@ if [[ $args == *@WIFIMAC@* ]]; then
 	[ -s wifimac.local ] || { echo "wifimac.local missing (12 hex digits)" >&2; exit 1; }
 	args=${args//@WIFIMAC@/$(tr -d ' \n' < wifimac.local)}
 fi
-[ -s "$out/agm.adt" ] || cp adt/agm.adt "$out/agm.adt"
+if [ ! -s "$out/agm.adt" ]; then
+	if [ ! -s adt/agm.adt ]; then           # the ADT: topaz tools/mkadt.py --agm (canvas 750x1624)
+		mkdir -p adt
+		ssh "$MAC" "cd $MAC_TOPAZ && python3 tools/mkadt.py /tmp/agm-new.adt --agm" && scp -q "$MAC:/tmp/agm-new.adt" adt/agm.adt
+	fi
+	cp adt/agm.adt "$out/agm.adt"
+fi
 scp -q "$out/agm.adt" "$MAC:/tmp/agm.adt"
 ssh "$MAC" "cd ~/topaz-xnu-build && python3 $MAC_TOPAZ/tools/mkpayload.py out/kernel.development.sweet /tmp/agm.adt /tmp/agm-payload.bin --cmdline '$args' > /dev/null"
 scp -q "$MAC:/tmp/agm-payload.bin" "$out/payload.bin"

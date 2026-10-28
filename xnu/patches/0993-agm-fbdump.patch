@@ -1,0 +1,71 @@
+From be69ce42834a866a2cb56f6b601eeb056cace494 Mon Sep 17 00:00:00 2001
+From: cunny <cunny@MacbookAirM1.lan>
+Date: Wed, 28 Oct 2026 05:31:01 +0300
+Subject: [PATCH] agm 0993: boot-arg agm_fbdump=N dumps the N-th directly
+ scanned frame to the root dump area
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 33 +++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4a3a302d2..b7479318a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -229,6 +229,7 @@ public:
+ 	bool          directEligible(const uint8_t *rec, SweetSurface **held);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	void          agmDpuInit(void);
++	void          agmFrameDump(SweetSurface *s, uintptr_t va);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -1020,6 +1021,37 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	fScanStride = stride;
+ }
+ 
++#if defined(SWEET_AGM)
++/*
++ * Debugging (boot-arg agm_fbdump=N): the N-th frame scanned directly is copied raw into the root
++ * partition's dump area (sweet_ufs_dump, iosroot + 33 GiB; from Android: dd skip=8650752 bs=4096),
++ * after a 4 KiB header {"AGMFBDMP", width, height, bytes a row, format}.
++ */
++extern "C" int sweet_ufs_dump(uint64_t off, const void *src, uint64_t len);
++
++void
++AppleCLCD::agmFrameDump(SweetSurface *s, uintptr_t va)
++{
++	static int32_t at = -1;
++	static uint32_t frames;
++	if (at < 0) {
++		at = 0;
++		(void)PE_parse_boot_argn("agm_fbdump", &at, sizeof(at));
++	}
++	if (at <= 0 || ++frames != (uint32_t)at) {
++		return;
++	}
++	static uint32_t hdr[1024];
++	hdr[0] = 0x46474d41; hdr[1] = 0x504d4442; hdr[2] = s->width; hdr[3] = s->height;
++	hdr[4] = s->bytesPerRow; hdr[5] = s->pixelFormat;
++	uint64_t len = ((uint64_t)s->height * s->bytesPerRow + 4095) & ~4095ull;
++	int e1 = sweet_ufs_dump(0, hdr, sizeof(hdr));
++	int e2 = sweet_ufs_dump(4096, (const void *)(va + s->offset), len);
++	IOLog("SWEET FB: frame %u (%ux%u, %u bytes a row) dumped: %d %d\n", frames, s->width, s->height,
++	    s->bytesPerRow, e1, e2);
++}
++#endif
++
+ /* Has the display engine not yet taken the address given last? */
+ bool
+ AppleCLCD::scanBusy(void)
+@@ -1475,6 +1507,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 					if (fDpu != NULL) {
+ 						/* the DPU takes the window by CROP_START from the surface's start (dpu_r5p0.c) */
+ 						fDpuCrop = (oy << 16) | ox;
++						agmFrameDump(s, va);
+ 						static uint32_t told;
+ 						if (told++ < 3) {
+ 							IOLog("SWEET FB: DPU scans surface %ux%u at %#llx, %u bytes a row, crop %u,%u\n", s->width,
+-- 
+2.39.5 (Apple Git-154)
+
