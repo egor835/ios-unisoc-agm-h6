@@ -1,0 +1,71 @@
+From 837636703aad6f85833fdb4f3ce47fcbb8f92a13 Mon Sep 17 00:00:00 2001
+From: cunny <cunny@MacbookAirM1.lan>
+Date: Wed, 28 Oct 2026 06:29:04 +0300
+Subject: [PATCH] agm 0994 wifi: wait up to 100 ms for a free TX buffer instead
+ of dropping the frame (uploads crawled under TCP back-off)
+
+---
+ bsd/dev/agm_wifi.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/agm_wifi.c b/bsd/dev/agm_wifi.c
+index f068c0eb4..9766a57c9 100644
+--- a/bsd/dev/agm_wifi.c
++++ b/bsd/dev/agm_wifi.c
+@@ -25,6 +25,7 @@
+ #include <sys/errno.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/random.h>
+@@ -1164,7 +1165,7 @@ static uint16_t dp_rx_back[DP_RX_N];            /* RX buffers to give back to th
+ static unsigned dp_rx_back_n;
+ static uint8_t dp_rx_out[DP_RX_N];              /* the firmware has it */
+ static LCK_MTX_DECLARE(dp_tx_lock, &wifi_lck_grp);
+-static struct { uint64_t rx, rx_bad, tx, tx_full, tx_fail, tx_reclaimed, txc, txc_bad, rx_posted; } dp_st;
++static struct { uint64_t rx, rx_bad, tx, tx_waited, tx_full, tx_fail, tx_reclaimed, txc, txc_bad, rx_posted; } dp_st;
+ static uint8_t dp_frame[DP_RX_LEN];
+ 
+ static void
+@@ -1359,9 +1360,9 @@ dp_tx_get(void)
+ static void
+ dp_print_stats(const char *why)
+ {
+-	printf("AGM WIFI data (%s): rx %llu (bad %llu), tx %llu (full %llu, failed %llu, taken back %llu), "
+-	    "tx done %llu (bad %llu), RX buffers given %llu\n", why, dp_st.rx, dp_st.rx_bad, dp_st.tx, dp_st.tx_full,
+-	    dp_st.tx_fail, dp_st.tx_reclaimed, dp_st.txc, dp_st.txc_bad, dp_st.rx_posted);
++	printf("AGM WIFI data (%s): rx %llu (bad %llu), tx %llu (waited %llu, full %llu, failed %llu, taken back %llu), "
++	    "tx done %llu (bad %llu), RX buffers given %llu\n", why, dp_st.rx, dp_st.rx_bad, dp_st.tx, dp_st.tx_waited,
++	    dp_st.tx_full, dp_st.tx_fail, dp_st.tx_reclaimed, dp_st.txc, dp_st.txc_bad, dp_st.rx_posted);
+ }
+ 
+ /* from the SIPC thread's loop (every 2 ms): RX buffers back to the firmware, now and then the counters */
+@@ -1390,7 +1391,23 @@ net_transmit(mbuf_t packet, size_t length)
+ 	if (dp_tx == 0 || sta_cstate != ST_CONNECTED || length < 14 || length > REDWOOD_NET_FRAME_MAX) {
+ 		return false;
+ 	}
++	/*
++	 * All 64 buffers out: wait (up to 100 ms) for the firmware's "done" instead of dropping the frame.
++	 * Dropped frames were TCP losses, and its retransmission back-off made uploads crawl at a few kbit/s
++	 * while downloads ran at 80 Mbit/s. (net_output's thread may sleep; the SIPC thread frees buffers.)
++	 */
+ 	int b = dp_tx_get();
++	for (unsigned t = 0; b < 0 && t < 200; t++) {
++		int chan;
++		uint64_t deadline;
++		clock_interval_to_deadline(500, NSEC_PER_USEC, &deadline);
++		(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		b = dp_tx_get();
++		if (t == 0) {
++			dp_st.tx_waited++;
++		}
++	}
+ 	if (b < 0) {
+ 		dp_st.tx_full++;
+ 		return false;
+-- 
+2.39.5 (Apple Git-154)
+
