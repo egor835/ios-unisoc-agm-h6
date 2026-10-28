@@ -29,7 +29,9 @@ tools/agm-backup.sh                         # 1. бэкап разделов и 
 tools/agm-repartition.sh                    # 2. раздел iosroot 128 ГиБ из конца userdata
                                             #    (СТИРАЕТ данные Android: потом recovery -> wipe data)
 shell/build-shell.sh                        # 3. toybox + agm-shelld (на Mac)
-tools/agm-mkroot.sh IPSW ios-root.img       # 4. корень iOS из IPSW (sudo), с шеллом
+AGM_BOOTSTRAP=1 tools/agm-mkroot.sh IPSW ios-root.img
+                                            # 4. корень iOS из IPSW (sudo), с шеллом; AGM_BOOTSTRAP=1 —
+                                            #    ещё rootless Procursus + Sileo (ставятся при 1-й загрузке)
 tools/agm-install.sh ios-root.img           # 5. записать корень в iosroot (+ MAC Wi-Fi в wifimac.local)
 tools/agm-build.sh agm                      # 6. ядро (Mac) + ADT + payload + shim -> xnu-out/agm/
 tools/agm-run.sh xnu-out/agm/shim-boot_b.img   # 7. загрузить iOS один раз и смотреть лог по USB
@@ -45,7 +47,8 @@ sudo nmcli con add type ethernet con-name agm-usb ifname '*' ethernet.mac-addres
 ## Каждый день
 
 - `tools/agm-run.sh IMG` — прошить `boot_b` и загрузить iOS один раз (из Android).
-- `tools/agm-sh.sh` — root-шелл на телефоне (toybox sh); `tools/agm-sh.sh 'команда'` — одна команда.
+- `tools/agm-sh.sh` — root-шелл на телефоне (bash из бутстрапа, без него toybox sh); `tools/agm-sh.sh 'команда'` — одна команда.
+- С бутстрапом: `ssh root@192.168.7.2` / `mobile@…` (пароль `alpine`, смените `passwd`), по Wi-Fi тоже; Sileo на домашнем экране, `apt` в шелле.
 - `tools/agm-usbnet.sh [файл]` — живой лог ядра (UDP 5140).
 - `tools/agm-reboot.sh` — перезагрузка из iOS (sync), телефон вернётся в Android.
 - `tools/agm-drop.py LOCAL=/путь[:MODE[:UID]] …` — положить файлы в корень iOS из Android, без

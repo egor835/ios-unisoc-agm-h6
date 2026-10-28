@@ -2,6 +2,7 @@
 """AGM H6 additions on top of ios-topaz tools/sweet-root-tweaks.py.
 
   sudo agm-root-tweaks.py MOUNTED_ROOT [SHELL_DIR] [--apps=copy|migrate]
+                         [--bootstrap=BOOTSTRAP.tar.zst --sileo=SILEO.deb]
 
 Run as root on the HFS+ root image mounted read-write. Idempotent.
 
@@ -31,6 +32,15 @@ Run as root on the HFS+ root image mounted read-write. Idempotent.
               *.disabled next to their directories.
   status bar  UIStatusBarVisualProviderClassName = the iPhone X's status bar (the screen is 375x812
               points @2x, kernel 0992 + mkadt.py canvas 750x1624; no iPhone has that scale).
+  mobile tmp  /private/var/mobile/tmp (mobile's temporary directory: apps without a container,
+              e.g. URLSession downloads, fail with ENOENT without it).
+  bootstrap   with --bootstrap/--sileo: the rootless Procursus bootstrap (iphoneos-arm64, CF 1900)
+              in /private/preboot/jb-agm and /var/jb -> it (as on real rootless jailbreaks: XNU
+              reports paths under /private/var as /var/..., which breaks Sileo's giveMeRoot check),
+              the markers Sileo detects it by (.procursus_strapped, .installed_dopamine),
+              /Applications/Sileo.app/Sileo -> the real one (giveMeRoot's build-time path), and
+              /var/jb/.agm-firstboot.sh, run once by agm-shelld at the first boot: prep_bootstrap.sh,
+              passwords "alpine" for root and mobile, dpkg -i Sileo, uicache.
   shell       with SHELL_DIR (shell/out from shell/build-shell.sh): /usr/bin/toybox and
               /usr/bin/agm-shelld, and a launchd job for agm-shelld (root shell on TCP
               port 2323, over USB Ethernet: tools/agm-sh.sh).
@@ -165,6 +175,70 @@ def status_bar(root):
     print("status bar: _UIStatusBarVisualProvider_Split1125")
 
 
+def mobile_tmp(root):
+    path = os.path.join(root, "private/var/mobile/tmp")
+    os.makedirs(path, exist_ok=True)
+    os.chown(path, MOBILE, MOBILE)
+    os.chmod(path, 0o755)
+    print("mobile tmp: /private/var/mobile/tmp")
+
+
+FIRSTBOOT = """#!/var/jb/bin/bash
+# agm-root-tweaks.py: the bootstrap's setup that needs iOS running; agm-shelld runs this once.
+set -x
+export PATH=/var/jb/usr/local/bin:/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+if [ -f /var/jb/prep_bootstrap.sh ]; then
+    NO_PASSWORD_PROMPT=1 /var/jb/bin/sh /var/jb/prep_bootstrap.sh
+fi
+printf 'alpine\\n' | pw usermod mobile -h 0
+printf 'alpine\\n' | pw usermod root -h 0
+dpkg -i /var/jb/var/cache/agm/sileo.deb && rm -f /var/jb/var/cache/agm/sileo.deb
+uicache -a
+rm -f /var/jb/.agm-firstboot.sh
+"""
+
+
+def bootstrap(root, tar_zst, sileo_deb):
+    import io
+    import subprocess
+    import tarfile
+    jb = os.path.join(root, "private/preboot/jb-agm")
+    os.makedirs(jb, exist_ok=True)
+    os.chmod(jb, 0o755)
+    raw = subprocess.run(["zstd", "-dc", tar_zst], check=True, capture_output=True).stdout
+    n = 0
+    with tarfile.open(fileobj=io.BytesIO(raw)) as t:
+        members = []
+        for m in t.getmembers():
+            if not m.name.startswith("./var/jb/"):
+                continue
+            m.name = m.name[len("./var/jb/"):]
+            if m.islnk() and m.linkname.startswith("./var/jb/"):
+                m.linkname = m.linkname[len("./var/jb/"):]
+            members.append(m)
+        t.extractall(jb, members=members, numeric_owner=True, filter="fully_trusted")
+        n = len(members)
+    link = os.path.join(root, "private/var/jb")
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink("/private/preboot/jb-agm", link)
+    for marker in (".procursus_strapped", ".installed_dopamine"):
+        open(os.path.join(jb, marker), "w").close()
+    cache = os.path.join(jb, "var/cache/agm")
+    os.makedirs(cache, exist_ok=True)
+    with open(sileo_deb, "rb") as f, open(os.path.join(cache, "sileo.deb"), "wb") as o:
+        o.write(f.read())
+    script = os.path.join(jb, ".agm-firstboot.sh")
+    with open(script, "w") as f:
+        f.write(FIRSTBOOT)
+    os.chmod(script, 0o755)
+    stub = os.path.join(root, "Applications/Sileo.app")
+    os.makedirs(stub, exist_ok=True)
+    if not os.path.lexists(os.path.join(stub, "Sileo")):
+        os.symlink("/var/jb/Applications/Sileo.app/Sileo", os.path.join(stub, "Sileo"))
+    print("bootstrap: %d entries in /private/preboot/jb-agm, /var/jb, Sileo at the first boot" % n)
+
+
 def shell(root, shell_dir):
     for name in ("toybox", "agm-shelld"):
         dst = os.path.join(root, "usr/bin", name)
@@ -190,6 +264,8 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
     apps = opts.get("apps", "copy")
+    if ("bootstrap" in opts) != ("sileo" in opts):
+        sys.exit("--bootstrap and --sileo go together")
     if len(args) not in (1, 2) or apps not in ("copy", "migrate") or \
             not os.path.isdir(os.path.join(args[0], "System/Library/xpc")):
         sys.exit(__doc__)
@@ -206,6 +282,9 @@ def main():
     launchd(root)
     plugins_off(root)
     status_bar(root)
+    mobile_tmp(root)
+    if "bootstrap" in opts:
+        bootstrap(root, opts["bootstrap"], opts["sileo"])
     if len(args) == 2:
         shell(root, args[1])
 

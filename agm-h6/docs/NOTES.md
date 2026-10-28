@@ -149,3 +149,11 @@
 ## Wi-Fi: скорость (2026-10-28)
 - Было ~2 Мбит/с в Safari: при занятых 64 TX-буферах `net_output` выбрасывал кадры, TCP откатывался таймаутами. 0994: ждать свободный буфер до 100 мс. Замер `nc` по Wi-Fi: приём 84 Мбит/с, передача 47 Мбит/с (toybox `nc` в роли клиента зависает на 135168 байтах — баг nc, не сети; мерить с телефоном-сервером).
 - На простое RTT до 2 с — энергосбережение прошивки; под нагрузкой 1–3 мс.
+
+## Procursus + Sileo (rootless, 2026-10-28)
+- Бутстрап `apt.procurs.us/bootstraps/1900/bootstrap-ssh-iphoneos-arm64.tar.zst` (sha256 2c639b83…), Sileo 2.5.1 rootless (8e3c90e5…). TrollStore Lite из Sileo ставится и работает.
+- Раскладка как у настоящих rootless-джейлбрейков: файлы в `/private/preboot/jb-agm`, `/var/jb` — ссылка. Наш XNU отдаёт пути процессов в `/private/var` как `/var/...` (proc_pidpath), а `realpath` — `/private/var/...`: проверки вида «родитель — Sileo» не сходились.
+- Sileo узнаёт окружение по маркерам: `/var/jb/.procursus_strapped` (rootless, префикс `/var/jb`) и `/var/jb/.installed_dopamine` (известный джейлбрейк → bootstrap `procursus`; иначе берёт `/bin/mkdir` и т.п., которых нет). root получает через persona 99 + uid 0 (`posix_spawnattr_set_persona_*`, entitlement `com.apple.private.persona-mgmt`) — в нашем ядре работает. `/Applications/Sileo.app/Sileo` → настоящий (путь сборки в `giveMeRoot`).
+- `/var/mobile/tmp` обязателен: без него URLSession у приложений без контейнера падает «No such file or directory» (Sileo: «Release returned status 200 …»).
+- toybox: `nc -l` читает терминал и обрывает приём — `< /dev/null`; `tar` из канала теряет хвост — распаковывать из файла; `sh` (toysh) зависает на части конструкций — с бутстрапом шелл = bash.
+- Службы бутстрапа (sshd) launchd из `launchd.plist` не берёт (пути вне /System) — `agm-shelld` при старте делает `launchctl load /var/jb/Library/LaunchDaemons`; при первой загрузке нового образа — `/var/jb/.agm-firstboot.sh` (prep_bootstrap, пароли, dpkg -i Sileo, uicache).

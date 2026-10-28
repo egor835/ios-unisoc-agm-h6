@@ -14,3 +14,4 @@ wcn/*.ini
 wifimac.local
 *.img
 __pycache__/
+bootstrap/
